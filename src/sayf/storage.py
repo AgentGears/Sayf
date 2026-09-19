@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
@@ -110,16 +112,14 @@ class SQLiteEventStore:
 
     @contextmanager
     def _connect(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
-        if read_only:
-            database = f"{self.path.resolve().as_uri()}?mode=ro"
-            connection = sqlite3.connect(
-                database,
-                timeout=30.0,
-                isolation_level=None,
-                uri=True,
-            )
-        else:
-            connection = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
+        mode = "ro" if read_only else "rw"
+        database = f"{self.path.resolve().as_uri()}?mode={mode}"
+        connection = sqlite3.connect(
+            database,
+            timeout=30.0,
+            isolation_level=None,
+            uri=True,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
@@ -145,7 +145,7 @@ class SQLiteEventStore:
             raise LedgerReadError(f"unable to read ledger database: {exc}") from exc
 
     def initialize(self) -> None:
-        created_new_file = False
+        candidate: Path | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             if self.path.exists():
@@ -154,30 +154,43 @@ class SQLiteEventStore:
                 self._validate_existing_ledger()
                 return
 
-            try:
-                with self.path.open("xb"):
-                    pass
-                created_new_file = True
-            except FileExistsError:
-                if not self.path.is_file():
-                    raise LedgerReadError("ledger database path is not a file") from None
-                self._validate_existing_ledger()
-                return
+            fd, candidate_name = tempfile.mkstemp(
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.init-",
+                suffix=".sqlite3",
+            )
+            os.close(fd)
+            candidate = Path(candidate_name)
+            candidate_store = SQLiteEventStore(candidate)
 
-            with self._connect() as connection:
+            with candidate_store._connect() as connection:
                 connection.executescript(_SCHEMA)
-                self._validate_database(connection)
-                verification, _, _ = self._verify_connection(connection)
+                candidate_store._validate_database(connection)
+                verification, _, _ = candidate_store._verify_connection(connection)
                 if not verification.valid:
                     raise LedgerReadError(self._verification_error(verification))
+
+            try:
+                os.link(candidate, self.path)
+            except FileExistsError:
+                self._validate_existing_ledger()
+                return
+            except OSError as exc:
+                raise LedgerReadError(
+                    f"unable to install new ledger atomically: {exc}"
+                ) from exc
+
+            self._validate_existing_ledger()
         except LedgerReadError:
-            if created_new_file:
-                self._remove_failed_initialization()
             raise
         except (OSError, sqlite3.Error) as exc:
-            if created_new_file:
-                self._remove_failed_initialization()
             raise LedgerReadError(f"unable to initialize ledger: {exc}") from exc
+        finally:
+            if candidate is not None:
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def append(self, draft: EventDraft) -> LedgerEvent:
         try:
@@ -430,12 +443,6 @@ class SQLiteEventStore:
                 f"{verification.reason}"
             )
         return f"ledger verification failed: {verification.reason}"
-
-    def _remove_failed_initialization(self) -> None:
-        try:
-            self.path.unlink(missing_ok=True)
-        except OSError:
-            pass
 
     @staticmethod
     def _validate_database(connection: sqlite3.Connection) -> None:
