@@ -16,7 +16,7 @@ For the initial implementation:
 
 - SQLite stores the ordered ledger;
 - event payloads are immutable after append;
-- a global SHA-256 hash chain provides tamper evidence;
+- a global SHA-256 hash chain provides local tamper evidence for content rewrites and chain discontinuities;
 - database triggers reject event updates and deletes;
 - current state is derived from events rather than stored as mutable semantic truth;
 - larger immutable artifacts will use content-addressed filesystem storage in M0.2;
@@ -33,7 +33,7 @@ A graph database, distributed log, ORM, or event-streaming platform would add in
 ### Positive
 
 - complete local history can be replayed;
-- historical mutation is visible;
+- content rewrites and interior chain discontinuities are detectable by independent verification;
 - supersession and invalidation can be expressed without rewriting old state;
 - adapters do not need an LLM to inspect authoritative history;
 - later projections can be rebuilt from source events.
@@ -43,7 +43,9 @@ A graph database, distributed log, ORM, or event-streaming platform would add in
 - schema evolution must be explicit;
 - projections must be rebuildable and version-aware;
 - distributed multi-writer operation is deferred;
-- cryptographic tamper evidence is not equivalent to an external trust anchor.
+- the local hash chain is not an external trust anchor;
+- if an attacker can bypass the database guards and delete the current tail, the remaining local chain alone cannot prove that truncation occurred;
+- stronger truncation detection therefore requires a future externally anchored checkpoint, signed head, replicated witness, or equivalent trust mechanism.
 
 ## Alternatives considered
 
@@ -65,4 +67,4 @@ Deferred until there is evidence that local SQLite semantics are insufficient.
 
 ## Revisit trigger
 
-Revisit the storage decision only when measured requirements demonstrate that single-node SQLite cannot meet required concurrency, durability, graph traversal, or deployment constraints without distorting the domain model.
+Revisit the storage/trust design when measured requirements demonstrate that single-node SQLite cannot meet required concurrency, durability, graph traversal, deployment, or tamper-evidence requirements without distorting the domain model. In particular, any requirement to detect ledger-tail truncation after local storage compromise requires an external checkpoint or witness mechanism rather than a stronger claim about the local hash chain alone.
