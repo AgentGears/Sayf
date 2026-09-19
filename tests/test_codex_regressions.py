@@ -1,21 +1,29 @@
 from __future__ import annotations
 
+import json
 import sqlite3
-import sys
+from types import SimpleNamespace
 
 import pytest
 import typer
 from typer.testing import CliRunner
 
+from sayf import cli as cli_module
 from sayf.cli import _parse_payload, app
 from sayf.storage import SQLiteEventStore
 
 runner = CliRunner()
 
 
-def _parser_recursion_payload() -> str:
-    depth = sys.getrecursionlimit() * 4
-    return '{"value":' + "[" * depth + "0" + "]" * depth + "}"
+def _force_json_recursion(monkeypatch) -> None:
+    def recursive_loads(*args, **kwargs):
+        raise RecursionError("forced JSON decoder recursion")
+
+    monkeypatch.setattr(
+        cli_module,
+        "json",
+        SimpleNamespace(loads=recursive_loads, JSONDecodeError=json.JSONDecodeError),
+    )
 
 
 @pytest.mark.parametrize("sequence", [0, -1])
@@ -55,13 +63,16 @@ def test_verify_nonpositive_sequence_fails_closed(tmp_path, sequence: int) -> No
     assert result.reason.startswith("malformed event row:")
 
 
-def test_parse_payload_converts_deep_recursion_to_bad_parameter() -> None:
+def test_parse_payload_converts_recursion_to_bad_parameter(monkeypatch) -> None:
+    _force_json_recursion(monkeypatch)
+
     with pytest.raises(typer.BadParameter, match="payload is not valid strict JSON"):
-        _parse_payload(_parser_recursion_payload())
+        _parse_payload("{}")
 
 
-def test_cli_rejects_deeply_nested_payload_without_traceback(tmp_path) -> None:
+def test_cli_converts_json_recursion_without_traceback(tmp_path, monkeypatch) -> None:
     db = tmp_path / "ledger.sqlite3"
+    _force_json_recursion(monkeypatch)
 
     result = runner.invoke(
         app,
@@ -71,7 +82,7 @@ def test_cli_rejects_deeply_nested_payload_without_traceback(tmp_path) -> None:
             "--type",
             "RecordCreated",
             "--payload",
-            _parser_recursion_payload(),
+            "{}",
             "--db",
             str(db),
         ],
