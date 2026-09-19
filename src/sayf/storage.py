@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import json
-import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
+import json
 from pathlib import Path
+import sqlite3
 
 from sayf.domain import Actor, EventDraft, LedgerEvent, LedgerVerification
 from sayf.hashing import canonical_json, compute_event_hash
