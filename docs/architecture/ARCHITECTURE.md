@@ -43,9 +43,9 @@ Each event includes:
 - previous event hash;
 - event hash.
 
-The hash chain is global rather than per stream. Verification recomputes each event hash and chain link from the currently stored canonical event contents. It therefore detects malformed rows, non-contiguous sequence state, broken links, and rewrites whose affected hashes were not recomputed consistently.
+The hash chain is global rather than per stream. Verification checks canonical stored JSON/timestamps, contiguous sequence state, each event hash, and each chain link against the currently stored event history. It therefore detects malformed or noncanonical rows, sequence gaps, broken links, and rewrites whose affected hashes were not recomputed consistently.
 
-The M0.1 hash chain is **not** an authenticity proof against an actor with arbitrary database write access. Such an actor can rewrite history and recompute the affected chain, or truncate the current tail, while leaving a locally self-consistent ledger. External checkpointing, signing, or witnessing is required to detect that stronger class of attack.
+The M0.1 hash chain is **not** an authenticity proof against an actor with arbitrary database write access. Such an actor can rewrite or renumber history and recompute the affected chain, or truncate the current tail, while leaving a locally self-consistent ledger. External checkpointing, signing, or witnessing is required to detect that stronger class of attack.
 
 SQLite triggers reject `UPDATE` and `DELETE` against the event table during normal database access. Hash verification is independent of those triggers, but its result remains a statement about local consistency rather than externally anchored authenticity.
 
@@ -54,13 +54,18 @@ SQLite triggers reject `UPDATE` and `DELETE` against the event table during norm
 M0 uses:
 
 - SQLite for ordered events and later graph projections;
-- a versioned, exact ledger schema identity for safe local operation;
+- SQLite `quick_check` as a local container-integrity prerequisite;
+- a versioned, exact ledger schema/metadata identity;
+- canonical stored representations for timestamps and structured event data;
+- complete local-history verification before authoritative listing or append;
 - filesystem content-addressed storage for larger immutable artifacts (M0.2+);
 - generated Markdown/JSON projections for humans and adapters.
 
 Human-readable projections are never authoritative storage.
 
-Initialization is creation-only and idempotent for an already valid ledger. It does not silently repair, migrate, or convert an existing unknown or damaged database. Repair and migration require explicit future operations.
+Initialization is creation-only and idempotent for an already locally valid ledger. It does not silently repair, migrate, convert, or legitimize an existing unknown, damaged, or history-invalid database. Repair and migration require explicit future operations.
+
+Appending currently re-verifies the complete existing local history inside the immediate write transaction. That is intentionally O(N) per append in M0.1; optimization is deferred until it can preserve the same fail-closed authority boundary.
 
 ## 5. Event sourcing
 
@@ -92,14 +97,14 @@ M0.1 implements the generic immutable event substrate before introducing these h
 
 - actor model;
 - UUIDv7 identifiers;
-- JSON-native event-value validation;
-- canonical serialization;
+- JSON-native/UTF-8 event-value validation;
+- canonical storage and serialization;
 - append-only SQLite storage;
-- versioned exact schema identity;
-- local hash-chain consistency verification;
-- replay/listing;
-- independent ledger verification;
-- CLI and CI tests.
+- SQLite container integrity check;
+- versioned exact schema/metadata identity;
+- local history consistency verification;
+- fail-closed authoritative replay/listing and append;
+- CLI and CI tests on Ubuntu and Windows.
 
 ### M0.2 — Typed Records + Graph
 
@@ -140,7 +145,7 @@ M0.1 implements the generic immutable event substrate before introducing these h
 5. Downstream impact must be explainable by relationship paths.
 6. Unknown is not equivalent to pass.
 7. The ledger must operate without an LLM.
-8. Existing authority stores are validated before mutation; unknown schema is fail-closed.
+8. Existing authority stores are validated before authoritative read or mutation; invalid local state is fail-closed.
 
 ## 8. Deliberate exclusions
 
