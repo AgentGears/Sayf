@@ -39,23 +39,28 @@ Each event includes:
 - event type;
 - UTC occurrence time;
 - actor;
-- structured payload;
+- structured JSON-native payload;
 - previous event hash;
 - event hash.
 
-The hash chain is global rather than per stream. A modification to any historical event therefore breaks verification of that point in the ledger and all subsequent chain continuity.
+The hash chain is global rather than per stream. Verification recomputes each event hash and chain link from the currently stored canonical event contents. It therefore detects malformed rows, non-contiguous sequence state, broken links, and rewrites whose affected hashes were not recomputed consistently.
 
-SQLite triggers reject `UPDATE` and `DELETE` against the event table. Hash verification remains independent of those triggers so unauthorized historical modification can still be detected if the database guard is bypassed.
+The M0.1 hash chain is **not** an authenticity proof against an actor with arbitrary database write access. Such an actor can rewrite history and recompute the affected chain, or truncate the current tail, while leaving a locally self-consistent ledger. External checkpointing, signing, or witnessing is required to detect that stronger class of attack.
+
+SQLite triggers reject `UPDATE` and `DELETE` against the event table during normal database access. Hash verification is independent of those triggers, but its result remains a statement about local consistency rather than externally anchored authenticity.
 
 ## 4. Persistent state strategy
 
 M0 uses:
 
 - SQLite for ordered events and later graph projections;
+- a versioned, exact ledger schema identity for safe local operation;
 - filesystem content-addressed storage for larger immutable artifacts (M0.2+);
 - generated Markdown/JSON projections for humans and adapters.
 
 Human-readable projections are never authoritative storage.
+
+Initialization is creation-only and idempotent for an already valid ledger. It does not silently repair, migrate, or convert an existing unknown or damaged database. Repair and migration require explicit future operations.
 
 ## 5. Event sourcing
 
@@ -87,9 +92,11 @@ M0.1 implements the generic immutable event substrate before introducing these h
 
 - actor model;
 - UUIDv7 identifiers;
+- JSON-native event-value validation;
 - canonical serialization;
 - append-only SQLite storage;
-- tamper-evident hash chain;
+- versioned exact schema identity;
+- local hash-chain consistency verification;
 - replay/listing;
 - independent ledger verification;
 - CLI and CI tests.
@@ -133,6 +140,7 @@ M0.1 implements the generic immutable event substrate before introducing these h
 5. Downstream impact must be explainable by relationship paths.
 6. Unknown is not equivalent to pass.
 7. The ledger must operate without an LLM.
+8. Existing authority stores are validated before mutation; unknown schema is fail-closed.
 
 ## 8. Deliberate exclusions
 
