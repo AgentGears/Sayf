@@ -93,9 +93,12 @@ class Actor(BaseModel):
 
 
 def _normalize_utc(value: datetime) -> datetime:
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("occurred_at must be timezone-aware")
-    return value.astimezone(UTC)
+    try:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("occurred_at must be timezone-aware")
+        return value.astimezone(UTC)
+    except OverflowError as exc:
+        raise ValueError("occurred_at cannot be normalized to UTC") from exc
 
 
 class EventDraft(BaseModel):
