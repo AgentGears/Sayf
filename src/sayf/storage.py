@@ -135,6 +135,19 @@ class SQLiteEventStore:
             sequence = int(row["sequence"])
             try:
                 event = self._row_to_event(row)
+                draft = EventDraft(
+                    event_id=event.event_id,
+                    stream_id=event.stream_id,
+                    event_type=event.event_type,
+                    occurred_at=event.occurred_at,
+                    actor=event.actor,
+                    payload=event.payload,
+                )
+                expected_hash = compute_event_hash(
+                    draft,
+                    sequence=event.sequence,
+                    previous_event_hash=previous_hash,
+                )
             except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as exc:
                 return LedgerVerification(
                     valid=False,
@@ -142,20 +155,6 @@ class SQLiteEventStore:
                     failure_sequence=sequence,
                     reason=f"malformed event row: {exc}",
                 )
-
-            draft = EventDraft(
-                event_id=event.event_id,
-                stream_id=event.stream_id,
-                event_type=event.event_type,
-                occurred_at=event.occurred_at,
-                actor=event.actor,
-                payload=event.payload,
-            )
-            expected_hash = compute_event_hash(
-                draft,
-                sequence=event.sequence,
-                previous_event_hash=previous_hash,
-            )
 
             if event.previous_event_hash != previous_hash:
                 return LedgerVerification(
