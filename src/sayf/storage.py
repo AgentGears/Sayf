@@ -137,7 +137,7 @@ class SQLiteEventStore:
 
         try:
             with self._connect(read_only=True) as connection:
-                self._validate_schema(connection)
+                self._validate_database(connection)
                 yield connection
         except LedgerReadError:
             raise
@@ -151,8 +151,8 @@ class SQLiteEventStore:
             if self.path.exists():
                 if not self.path.is_file():
                     raise LedgerReadError("ledger database path is not a file")
-                with self._read_connection():
-                    return
+                self._validate_existing_ledger()
+                return
 
             try:
                 with self.path.open("xb"):
@@ -161,12 +161,15 @@ class SQLiteEventStore:
             except FileExistsError:
                 if not self.path.is_file():
                     raise LedgerReadError("ledger database path is not a file") from None
-                with self._read_connection():
-                    return
+                self._validate_existing_ledger()
+                return
 
             with self._connect() as connection:
                 connection.executescript(_SCHEMA)
-                self._validate_schema(connection)
+                self._validate_database(connection)
+                verification, _, _ = self._verify_connection(connection)
+                if not verification.valid:
+                    raise LedgerReadError(self._verification_error(verification))
         except LedgerReadError:
             if created_new_file:
                 self._remove_failed_initialization()
@@ -193,7 +196,7 @@ class SQLiteEventStore:
             with self._connect() as connection:
                 try:
                     connection.execute("BEGIN IMMEDIATE")
-                    self._validate_schema(connection)
+                    self._validate_database(connection)
                     verification, _, previous_hash = self._verify_connection(connection)
                     if not verification.valid:
                         raise LedgerReadError(self._verification_error(verification))
@@ -270,6 +273,12 @@ class SQLiteEventStore:
                 reason=str(exc),
             )
 
+    def _validate_existing_ledger(self) -> None:
+        with self._read_connection() as connection:
+            verification, _, _ = self._verify_connection(connection)
+        if not verification.valid:
+            raise LedgerReadError(self._verification_error(verification))
+
     def _verify_connection(
         self,
         connection: sqlite3.Connection,
@@ -284,14 +293,53 @@ class SQLiteEventStore:
         for row in cursor:
             sequence = row["sequence"]
             try:
+                raw_occurred_at = self._required_text(row, "occurred_at")
+                raw_actor_json = self._required_text(row, "actor_json")
+                raw_payload_json = self._required_text(row, "payload_json")
                 event = self._row_to_event(row)
+                canonical_actor_json = canonical_json(event.actor.model_dump(mode="json"))
+                canonical_payload_json = canonical_json(event.payload)
             except _MALFORMED_ROW_ERRORS as exc:
                 return (
                     LedgerVerification(
                         valid=False,
                         checked_events=checked_events,
-                        failure_sequence=(int(sequence) if isinstance(sequence, int) else None),
+                        failure_sequence=(int(sequence) if type(sequence) is int else None),
                         reason=f"malformed event row: {exc}",
+                    ),
+                    events,
+                    previous_hash,
+                )
+
+            if raw_occurred_at != event.occurred_at.isoformat():
+                return (
+                    LedgerVerification(
+                        valid=False,
+                        checked_events=checked_events,
+                        failure_sequence=event.sequence,
+                        reason="stored event timestamp is not canonical",
+                    ),
+                    events,
+                    previous_hash,
+                )
+            if raw_actor_json != canonical_actor_json:
+                return (
+                    LedgerVerification(
+                        valid=False,
+                        checked_events=checked_events,
+                        failure_sequence=event.sequence,
+                        reason="stored actor JSON is not canonical",
+                    ),
+                    events,
+                    previous_hash,
+                )
+            if raw_payload_json != canonical_payload_json:
+                return (
+                    LedgerVerification(
+                        valid=False,
+                        checked_events=checked_events,
+                        failure_sequence=event.sequence,
+                        reason="stored payload JSON is not canonical",
                     ),
                     events,
                     previous_hash,
@@ -390,6 +438,18 @@ class SQLiteEventStore:
             pass
 
     @staticmethod
+    def _validate_database(connection: sqlite3.Connection) -> None:
+        SQLiteEventStore._validate_sqlite_integrity(connection)
+        SQLiteEventStore._validate_schema(connection)
+
+    @staticmethod
+    def _validate_sqlite_integrity(connection: sqlite3.Connection) -> None:
+        results = [str(row[0]) for row in connection.execute("PRAGMA quick_check").fetchall()]
+        if results != ["ok"]:
+            detail = "; ".join(results) if results else "no result"
+            raise LedgerReadError(f"SQLite quick_check failed: {detail}")
+
+    @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
         marker = connection.execute(
             """
@@ -404,11 +464,12 @@ class SQLiteEventStore:
         ]:
             raise LedgerReadError("Sayf ledger schema marker is malformed")
 
-        marker_row = connection.execute(
-            "SELECT value FROM sayf_ledger_meta WHERE key = 'schema_version'"
-        ).fetchone()
-        if marker_row is None or str(marker_row["value"]) != _LEDGER_SCHEMA_VERSION:
-            raise LedgerReadError("Sayf ledger schema version is unsupported")
+        metadata_rows = connection.execute(
+            "SELECT key, value FROM sayf_ledger_meta ORDER BY key"
+        ).fetchall()
+        metadata = [(str(row["key"]), str(row["value"])) for row in metadata_rows]
+        if metadata != [("schema_version", _LEDGER_SCHEMA_VERSION)]:
+            raise LedgerReadError("Sayf ledger metadata is unsupported or malformed")
 
         rows = connection.execute(
             """
@@ -434,15 +495,38 @@ class SQLiteEventStore:
                 )
 
     @staticmethod
+    def _required_text(row: sqlite3.Row, column: str) -> str:
+        value = row[column]
+        if not isinstance(value, str):
+            raise ValueError(f"stored {column} must be text")
+        return value
+
+    @staticmethod
     def _row_to_event(row: sqlite3.Row) -> LedgerEvent:
+        sequence = row["sequence"]
+        if type(sequence) is not int:
+            raise ValueError("stored sequence must be an integer")
+
+        previous_hash = row["previous_event_hash"]
+        if previous_hash is not None and not isinstance(previous_hash, str):
+            raise ValueError("stored previous_event_hash must be text or null")
+
+        event_id = SQLiteEventStore._required_text(row, "event_id")
+        stream_id = SQLiteEventStore._required_text(row, "stream_id")
+        event_type = SQLiteEventStore._required_text(row, "event_type")
+        occurred_at = SQLiteEventStore._required_text(row, "occurred_at")
+        actor_json = SQLiteEventStore._required_text(row, "actor_json")
+        payload_json = SQLiteEventStore._required_text(row, "payload_json")
+        event_hash = SQLiteEventStore._required_text(row, "event_hash")
+
         return LedgerEvent(
-            event_id=str(row["event_id"]),
-            sequence=int(row["sequence"]),
-            stream_id=str(row["stream_id"]),
-            event_type=str(row["event_type"]),
-            occurred_at=datetime.fromisoformat(str(row["occurred_at"])),
-            actor=Actor.model_validate(json.loads(str(row["actor_json"]))),
-            payload=json.loads(str(row["payload_json"])),
-            previous_event_hash=row["previous_event_hash"],
-            event_hash=str(row["event_hash"]),
+            event_id=event_id,
+            sequence=sequence,
+            stream_id=stream_id,
+            event_type=event_type,
+            occurred_at=datetime.fromisoformat(occurred_at),
+            actor=Actor.model_validate(json.loads(actor_json)),
+            payload=json.loads(payload_json),
+            previous_event_hash=previous_hash,
+            event_hash=event_hash,
         )
