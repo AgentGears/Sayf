@@ -53,6 +53,19 @@ _REQUIRED_EVENT_COLUMNS = {
     "event_hash",
 }
 
+_MALFORMED_ROW_ERRORS = (
+    json.JSONDecodeError,
+    ValidationError,
+    TypeError,
+    ValueError,
+    OverflowError,
+    RecursionError,
+)
+
+
+class LedgerReadError(RuntimeError):
+    """Raised when an existing Sayf ledger cannot be inspected safely."""
+
 
 class SQLiteEventStore:
     """Append-only SQLite store for the authoritative Sayf event ledger."""
@@ -139,63 +152,33 @@ class SQLiteEventStore:
         )
 
     def events(self) -> list[LedgerEvent]:
-        self.initialize()
-        with self._connect() as connection:
-            rows = connection.execute("SELECT * FROM events ORDER BY sequence").fetchall()
-        return [self._row_to_event(row) for row in rows]
+        rows = self._read_rows()
+        events: list[LedgerEvent] = []
+        for row in rows:
+            sequence = row["sequence"]
+            try:
+                events.append(self._row_to_event(row))
+            except _MALFORMED_ROW_ERRORS as exc:
+                raise LedgerReadError(
+                    f"malformed event row at sequence {sequence}: {exc}"
+                ) from exc
+        return events
 
     def verify(self) -> LedgerVerification:
-        if not self.path.exists():
-            return LedgerVerification(
-                valid=False,
-                checked_events=0,
-                reason="ledger database does not exist",
-            )
-        if not self.path.is_file():
-            return LedgerVerification(
-                valid=False,
-                checked_events=0,
-                reason="ledger database path is not a file",
-            )
-
         try:
-            with self._connect(read_only=True) as connection:
-                table = connection.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'"
-                ).fetchone()
-                if table is None:
-                    return LedgerVerification(
-                        valid=False,
-                        checked_events=0,
-                        reason="Sayf ledger schema is not initialized",
-                    )
-
-                columns = {
-                    str(row["name"])
-                    for row in connection.execute("PRAGMA table_info(events)").fetchall()
-                }
-                if not _REQUIRED_EVENT_COLUMNS.issubset(columns):
-                    return LedgerVerification(
-                        valid=False,
-                        checked_events=0,
-                        reason="Sayf ledger schema is incomplete",
-                    )
-
-                rows = connection.execute(
-                    "SELECT * FROM events ORDER BY sequence"
-                ).fetchall()
-        except sqlite3.Error as exc:
+            rows = self._read_rows()
+        except LedgerReadError as exc:
             return LedgerVerification(
                 valid=False,
                 checked_events=0,
-                reason=f"unable to read ledger database: {exc}",
+                reason=str(exc),
             )
 
         previous_hash: str | None = None
         checked_events = 0
 
         for row in rows:
-            sequence = int(row["sequence"])
+            sequence = row["sequence"]
             try:
                 event = self._row_to_event(row)
                 draft = EventDraft(
@@ -211,11 +194,11 @@ class SQLiteEventStore:
                     sequence=event.sequence,
                     previous_event_hash=previous_hash,
                 )
-            except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as exc:
+            except _MALFORMED_ROW_ERRORS as exc:
                 return LedgerVerification(
                     valid=False,
                     checked_events=checked_events,
-                    failure_sequence=sequence,
+                    failure_sequence=int(sequence) if isinstance(sequence, int) else None,
                     reason=f"malformed event row: {exc}",
                 )
 
@@ -239,6 +222,38 @@ class SQLiteEventStore:
             checked_events += 1
 
         return LedgerVerification(valid=True, checked_events=checked_events)
+
+    def _read_rows(self) -> list[sqlite3.Row]:
+        if not self.path.exists():
+            raise LedgerReadError("ledger database does not exist")
+        if not self.path.is_file():
+            raise LedgerReadError("ledger database path is not a file")
+
+        try:
+            with self._connect(read_only=True) as connection:
+                self._validate_schema(connection)
+                return connection.execute(
+                    "SELECT * FROM events ORDER BY sequence"
+                ).fetchall()
+        except LedgerReadError:
+            raise
+        except sqlite3.Error as exc:
+            raise LedgerReadError(f"unable to read ledger database: {exc}") from exc
+
+    @staticmethod
+    def _validate_schema(connection: sqlite3.Connection) -> None:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'"
+        ).fetchone()
+        if table is None:
+            raise LedgerReadError("Sayf ledger schema is not initialized")
+
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(events)").fetchall()
+        }
+        if not _REQUIRED_EVENT_COLUMNS.issubset(columns):
+            raise LedgerReadError("Sayf ledger schema is incomplete")
 
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> LedgerEvent:
