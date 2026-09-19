@@ -128,11 +128,15 @@ Actor type alone does not confer trust or authority.
 
 The hash input includes the complete event envelope except `event_hash`, serialized with deterministic JSON key ordering and compact separators. SHA-256 is used for the M0 chain.
 
+The M0.1 chain is an **internal consistency mechanism**, not an external authenticity anchor. Verification can detect malformed rows, broken hash links, and content changes whose affected hashes were not recomputed. An actor with arbitrary write access can instead rewrite records and recompute the entire affected chain, or truncate the current tail, while preserving local consistency. Detecting that stronger adversary requires a future external checkpoint, signature, replicated witness, or equivalent trust anchor.
+
 ### Storage enforcement
 
 SQLite serializes append operations with an immediate transaction and rejects `UPDATE` and `DELETE` on the event table using database triggers.
 
-`ledger verify` recomputes the chain independently so historical tampering remains detectable if those guards are bypassed.
+Read-only inspection and verification open only an existing initialized ledger and never create schema or files as a side effect.
+
+`ledger verify` recomputes the chain independently to validate the stored ledger against its own canonical event contents and linkage. Its result is a statement about current local consistency, not proof that no privileged writer has ever replaced the history.
 
 ## M0 acceptance scenario
 
@@ -167,8 +171,10 @@ M0.1 is complete when:
 1. event append is transactional;
 2. event order is deterministic;
 3. historical rows cannot be updated or deleted through normal database access;
-4. hash-chain verification succeeds for valid history;
-5. verification fails at the first modified historical event if storage guards are bypassed;
-6. duplicate event IDs are rejected;
-7. the CLI can initialize, append, display, and verify a ledger;
-8. CI executes lint and tests on pull requests.
+4. hash-chain verification succeeds for valid local history;
+5. verification fails on malformed rows, broken chain links, and modified event content when the stored hashes were not recomputed consistently;
+6. read-only inspection/verification do not initialize missing or unrelated databases;
+7. duplicate event IDs are rejected;
+8. the CLI can initialize, append, display, and verify a ledger;
+9. the trust boundary of the unanchored local hash chain is documented explicitly;
+10. CI executes lint and tests on pull requests.
