@@ -103,6 +103,7 @@ def test_verify_detects_tampering_even_if_storage_guard_is_bypassed(tmp_path) ->
         ("actor_json", "{}"),
         ("payload_json", "{"),
         ("occurred_at", "not-a-timestamp"),
+        ("event_type", ""),
     ],
 )
 def test_verify_reports_malformed_rows_as_verification_failures(
