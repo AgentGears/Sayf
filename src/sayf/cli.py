@@ -46,7 +46,10 @@ def _parse_payload(payload: str) -> dict[str, Any]:
 
 @app.command()
 def init(
-    root: Annotated[Path, typer.Argument(help="Project root to initialize or validate.")] = Path("."),
+    root: Annotated[
+        Path,
+        typer.Argument(help="Project root to initialize or validate."),
+    ] = Path("."),
 ) -> None:
     db = root / DEFAULT_DB
     try:
