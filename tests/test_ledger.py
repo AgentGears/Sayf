@@ -151,6 +151,29 @@ def test_verify_rejects_unsupported_schema_version(tmp_path) -> None:
     assert result.reason == "Sayf ledger schema version is unsupported"
 
 
+def test_append_rejects_unsupported_schema_without_writing(tmp_path) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    store.initialize()
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE sayf_ledger_meta SET value = '999' WHERE key = 'schema_version'"
+        )
+        connection.commit()
+
+    with pytest.raises(LedgerReadError, match="schema version is unsupported"):
+        store.append(_draft("RecordCreated"))
+
+    with sqlite3.connect(path) as connection:
+        count = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        version = connection.execute(
+            "SELECT value FROM sayf_ledger_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+    assert count == 0
+    assert version == "999"
+
+
 def test_verify_rejects_missing_immutability_trigger(tmp_path) -> None:
     path = tmp_path / "ledger.sqlite3"
     store = SQLiteEventStore(path)
@@ -164,6 +187,30 @@ def test_verify_rejects_missing_immutability_trigger(tmp_path) -> None:
 
     assert result.valid is False
     assert result.reason == "Sayf ledger trigger events_no_delete is missing or malformed"
+
+
+def test_verify_rejects_disabled_immutability_trigger(tmp_path) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    store.initialize()
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TRIGGER events_no_update")
+        connection.executescript(
+            """
+            CREATE TRIGGER events_no_update
+            BEFORE UPDATE ON events
+            WHEN 0
+            BEGIN
+                SELECT RAISE(ABORT, 'Sayf ledger events are immutable');
+            END;
+            """
+        )
+
+    result = store.verify()
+
+    assert result.valid is False
+    assert result.reason == "Sayf ledger trigger events_no_update is missing or malformed"
 
 
 def test_verify_rejects_missing_unique_constraints(tmp_path) -> None:
