@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from pydantic import ValidationError
 
@@ -33,6 +35,18 @@ def test_hashed_identifier_rejects_unpaired_unicode_surrogate() -> None:
             stream_id="project:\ud800",
             event_type="RecordCreated",
             actor=Actor(kind=ActorKind.HUMAN, id="tester"),
+        )
+
+
+def test_extreme_aware_timestamp_becomes_validation_error() -> None:
+    plus_fourteen = timezone(timedelta(hours=14))
+
+    with pytest.raises(ValidationError, match="cannot be normalized to UTC"):
+        EventDraft(
+            stream_id="project:test",
+            event_type="RecordCreated",
+            actor=Actor(kind=ActorKind.HUMAN, id="tester"),
+            occurred_at=datetime(1, 1, 1, 0, 0, tzinfo=plus_fourteen),
         )
 
 
