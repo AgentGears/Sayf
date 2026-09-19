@@ -13,6 +13,7 @@ from sayf.domain import Actor, EventDraft, LedgerEvent, LedgerVerification
 from sayf.hashing import canonical_json, compute_event_hash
 
 _LEDGER_SCHEMA_VERSION = "1"
+_IMMUTABILITY_MESSAGE = "Sayf ledger events are immutable"
 
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS sayf_ledger_meta (
@@ -41,13 +42,13 @@ CREATE INDEX IF NOT EXISTS idx_events_stream_sequence
 CREATE TRIGGER IF NOT EXISTS events_no_update
 BEFORE UPDATE ON events
 BEGIN
-    SELECT RAISE(ABORT, 'Sayf ledger events are immutable');
+    SELECT RAISE(ABORT, '{_IMMUTABILITY_MESSAGE}');
 END;
 
 CREATE TRIGGER IF NOT EXISTS events_no_delete
 BEFORE DELETE ON events
 BEGIN
-    SELECT RAISE(ABORT, 'Sayf ledger events are immutable');
+    SELECT RAISE(ABORT, '{_IMMUTABILITY_MESSAGE}');
 END;
 """
 
@@ -64,9 +65,34 @@ _EXPECTED_EVENT_COLUMNS = {
 }
 
 _EXPECTED_UNIQUE_COLUMN_SETS = {frozenset({"event_id"}), frozenset({"event_hash"})}
+
+
+def _normalize_schema_sql(sql: str) -> str:
+    normalized = " ".join(sql.strip().split()).lower()
+    normalized = normalized.replace("create trigger if not exists ", "create trigger ")
+    normalized = normalized.replace(";", "")
+    return normalized
+
+
 _EXPECTED_IMMUTABILITY_TRIGGERS = {
-    "events_no_update": "before update on events",
-    "events_no_delete": "before delete on events",
+    "events_no_update": _normalize_schema_sql(
+        f"""
+        CREATE TRIGGER events_no_update
+        BEFORE UPDATE ON events
+        BEGIN
+            SELECT RAISE(ABORT, '{_IMMUTABILITY_MESSAGE}');
+        END;
+        """
+    ),
+    "events_no_delete": _normalize_schema_sql(
+        f"""
+        CREATE TRIGGER events_no_delete
+        BEFORE DELETE ON events
+        BEGIN
+            SELECT RAISE(ABORT, '{_IMMUTABILITY_MESSAGE}');
+        END;
+        """
+    ),
 }
 
 _MALFORMED_ROW_ERRORS = (
@@ -80,7 +106,7 @@ _MALFORMED_ROW_ERRORS = (
 
 
 class LedgerReadError(RuntimeError):
-    """Raised when an existing Sayf ledger cannot be inspected safely."""
+    """Raised when a Sayf ledger cannot be used safely with this runtime."""
 
 
 class SQLiteEventStore:
@@ -131,10 +157,15 @@ class SQLiteEventStore:
             connection.executescript(_SCHEMA)
 
     def append(self, draft: EventDraft) -> LedgerEvent:
-        self.initialize()
+        if not self.path.exists():
+            self.initialize()
+        elif not self.path.is_file():
+            raise LedgerReadError("ledger database path is not a file")
+
         with self._connect() as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                self._validate_schema(connection)
                 row = connection.execute(
                     "SELECT sequence, event_hash FROM events ORDER BY sequence DESC LIMIT 1"
                 ).fetchone()
@@ -300,10 +331,14 @@ class SQLiteEventStore:
 
         unique_column_sets: set[frozenset[str]] = set()
         indexes = connection.execute("PRAGMA index_list(events)").fetchall()
+        stream_index_is_non_unique = False
         for index in indexes:
+            index_name_raw = str(index["name"])
+            if index_name_raw == "idx_events_stream_sequence":
+                stream_index_is_non_unique = int(index["unique"]) == 0
             if int(index["unique"]) != 1:
                 continue
-            index_name = str(index["name"]).replace("'", "''")
+            index_name = index_name_raw.replace("'", "''")
             index_columns = connection.execute(
                 f"PRAGMA index_info('{index_name}')"
             ).fetchall()
@@ -313,14 +348,8 @@ class SQLiteEventStore:
         if not _EXPECTED_UNIQUE_COLUMN_SETS.issubset(unique_column_sets):
             raise LedgerReadError("Sayf ledger unique constraints are incomplete")
 
-        stream_index = connection.execute(
-            """
-            SELECT 1 FROM sqlite_master
-            WHERE type = 'index' AND name = 'idx_events_stream_sequence'
-            """
-        ).fetchone()
-        if stream_index is None:
-            raise LedgerReadError("Sayf ledger stream index is missing")
+        if not stream_index_is_non_unique:
+            raise LedgerReadError("Sayf ledger stream index is missing or unexpectedly unique")
         stream_index_columns = [
             str(row["name"])
             for row in connection.execute(
@@ -331,7 +360,7 @@ class SQLiteEventStore:
             raise LedgerReadError("Sayf ledger stream index is malformed")
 
         triggers = {
-            str(row["name"]): str(row["sql"] or "").lower()
+            str(row["name"]): _normalize_schema_sql(str(row["sql"] or ""))
             for row in connection.execute(
                 """
                 SELECT name, sql FROM sqlite_master
@@ -339,9 +368,8 @@ class SQLiteEventStore:
                 """
             ).fetchall()
         }
-        for name, required_clause in _EXPECTED_IMMUTABILITY_TRIGGERS.items():
-            sql = " ".join(triggers.get(name, "").split())
-            if required_clause not in sql or "raise(abort" not in sql:
+        for name, expected_sql in _EXPECTED_IMMUTABILITY_TRIGGERS.items():
+            if triggers.get(name) != expected_sql:
                 raise LedgerReadError(f"Sayf ledger trigger {name} is missing or malformed")
 
     @staticmethod
