@@ -46,7 +46,7 @@ def _parse_payload(payload: str) -> dict[str, Any]:
 
 @app.command()
 def init(
-    root: Annotated[Path, typer.Argument(help="Project root to initialize.")] = Path("."),
+    root: Annotated[Path, typer.Argument(help="Project root to initialize or validate.")] = Path("."),
 ) -> None:
     db = root / DEFAULT_DB
     try:
@@ -54,7 +54,7 @@ def init(
     except LedgerReadError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
-    typer.echo(f"Initialized Sayf ledger at {db}")
+    typer.echo(f"Sayf ledger ready at {db}")
 
 
 @ledger_app.command("append")
