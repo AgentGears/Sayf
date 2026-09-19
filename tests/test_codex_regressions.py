@@ -3,9 +3,10 @@ from __future__ import annotations
 import sqlite3
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
-from sayf.cli import app
+from sayf.cli import _parse_payload, app
 from sayf.storage import SQLiteEventStore
 
 runner = CliRunner()
@@ -48,6 +49,13 @@ def test_verify_nonpositive_sequence_fails_closed(tmp_path, sequence: int) -> No
     assert result.reason.startswith("malformed event row:")
 
 
+def test_parse_payload_converts_deep_recursion_to_bad_parameter() -> None:
+    payload = '{"value":' + "[" * 2000 + "0" + "]" * 2000 + "}"
+
+    with pytest.raises(typer.BadParameter, match="payload is not valid strict JSON"):
+        _parse_payload(payload)
+
+
 def test_cli_rejects_deeply_nested_payload_without_traceback(tmp_path) -> None:
     db = tmp_path / "ledger.sqlite3"
     payload = '{"value":' + "[" * 2000 + "0" + "]" * 2000 + "}"
@@ -66,7 +74,6 @@ def test_cli_rejects_deeply_nested_payload_without_traceback(tmp_path) -> None:
         ],
     )
 
-    assert result.exit_code != 0
-    assert "payload is not valid strict JSON" in result.output
+    assert result.exit_code == 2
     assert "Traceback" not in result.output
     assert db.exists() is False
