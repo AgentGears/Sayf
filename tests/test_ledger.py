@@ -174,6 +174,17 @@ def test_append_rejects_unsupported_schema_without_writing(tmp_path) -> None:
     assert version == "999"
 
 
+def test_append_non_sqlite_file_returns_ledger_error_without_rewriting(tmp_path) -> None:
+    path = tmp_path / "corrupt.sqlite3"
+    original = "this is not sqlite"
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(LedgerReadError, match="unable to append to ledger"):
+        SQLiteEventStore(path).append(_draft("RecordCreated"))
+
+    assert path.read_text(encoding="utf-8") == original
+
+
 def test_verify_rejects_missing_immutability_trigger(tmp_path) -> None:
     path = tmp_path / "ledger.sqlite3"
     store = SQLiteEventStore(path)
@@ -234,6 +245,49 @@ def test_verify_rejects_missing_unique_constraints(tmp_path) -> None:
                 previous_event_hash TEXT,
                 event_hash TEXT NOT NULL
             );
+            CREATE INDEX idx_events_stream_sequence ON events(stream_id, sequence);
+            CREATE TRIGGER events_no_update
+            BEFORE UPDATE ON events
+            BEGIN
+                SELECT RAISE(ABORT, 'Sayf ledger events are immutable');
+            END;
+            CREATE TRIGGER events_no_delete
+            BEFORE DELETE ON events
+            BEGIN
+                SELECT RAISE(ABORT, 'Sayf ledger events are immutable');
+            END;
+            """
+        )
+
+    result = SQLiteEventStore(path).verify()
+
+    assert result.valid is False
+    assert result.reason == "Sayf ledger unique constraints are incomplete"
+
+
+def test_verify_rejects_partial_unique_indexes(tmp_path) -> None:
+    path = tmp_path / "partial-index-ledger.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE sayf_ledger_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO sayf_ledger_meta (key, value) VALUES ('schema_version', '1');
+            CREATE TABLE events (
+                sequence INTEGER PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                stream_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                actor_json TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                previous_event_hash TEXT,
+                event_hash TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX fake_event_id_unique ON events(event_id) WHERE 0;
+            CREATE UNIQUE INDEX fake_event_hash_unique ON events(event_hash) WHERE 0;
             CREATE INDEX idx_events_stream_sequence ON events(stream_id, sequence);
             CREATE TRIGGER events_no_update
             BEFORE UPDATE ON events
@@ -426,5 +480,5 @@ def test_duplicate_event_id_is_rejected(tmp_path) -> None:
         payload={},
     )
 
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(LedgerReadError, match="UNIQUE constraint failed: events.event_id"):
         store.append(duplicate)
