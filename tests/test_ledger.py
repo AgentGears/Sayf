@@ -51,6 +51,49 @@ def test_event_draft_normalizes_aware_timestamp_to_utc() -> None:
     assert draft.occurred_at.tzinfo is UTC
 
 
+def test_verify_missing_database_fails_without_creating_it(tmp_path) -> None:
+    path = tmp_path / "missing-ledger.sqlite3"
+    store = SQLiteEventStore(path)
+
+    result = store.verify()
+
+    assert result.valid is False
+    assert result.checked_events == 0
+    assert result.reason == "ledger database does not exist"
+    assert path.exists() is False
+
+
+def test_verify_uninitialized_database_fails_without_mutating_schema(tmp_path) -> None:
+    path = tmp_path / "not-a-ledger.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+        connection.commit()
+
+    result = SQLiteEventStore(path).verify()
+
+    assert result.valid is False
+    assert result.checked_events == 0
+    assert result.reason == "Sayf ledger schema is not initialized"
+    with sqlite3.connect(path) as connection:
+        events_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'"
+        ).fetchone()
+    assert events_table is None
+
+
+def test_verify_explicitly_initialized_empty_ledger_is_valid(tmp_path) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    store.initialize()
+
+    result = store.verify()
+
+    assert result.valid is True
+    assert result.checked_events == 0
+    assert result.failure_sequence is None
+    assert result.reason is None
+
+
 def test_append_builds_global_hash_chain(tmp_path) -> None:
     store = SQLiteEventStore(tmp_path / "ledger.sqlite3")
 
