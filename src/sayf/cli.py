@@ -47,7 +47,11 @@ def append_event(
         actor=Actor(kind=actor_kind, id=actor_id),
         payload=payload_value,
     )
-    event = SQLiteEventStore(db).append(draft)
+    try:
+        event = SQLiteEventStore(db).append(draft)
+    except LedgerReadError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
     typer.echo(event.model_dump_json(indent=2))
 
 
