@@ -93,6 +93,10 @@ Sayf must be able to enumerate downstream dependents and explain each relationsh
 
 Missing evidence is not successful evidence; an uninspected relationship is not proof that no relationship exists; absence of a contradiction is not proof of a claim.
 
+### M0-I7 — Unknown storage is fail-closed
+
+An existing database is validated as the exact supported Sayf schema before mutation. Initialization does not silently repair, migrate, or convert unknown or damaged storage.
+
 ## M0.1 — Immutable Ledger
 
 M0.1 freezes the event envelope and persistence behavior.
@@ -111,7 +115,7 @@ previous_event_hash
 event_hash
 ```
 
-`sequence` is globally monotonic. The previous hash is the global ledger head, not merely the prior event in the same logical stream.
+`sequence` is globally contiguous from `1..N` for valid local history. The previous hash is the global ledger head, not merely the prior event in the same logical stream.
 
 ### Actor kinds
 
@@ -124,19 +128,27 @@ event_hash
 
 Actor type alone does not confer trust or authority.
 
+### JSON-native values
+
+Event payloads and actor metadata are normalized into detached JSON-native values before authoritative persistence. Supported values are JSON objects, arrays, strings, booleans, integers, finite floating-point numbers, and `null`. Non-finite numbers, non-string object keys, circular/non-JSON Python objects, and excessive recursive structures are rejected.
+
+The CLI additionally rejects non-standard JSON constants and duplicate object keys before an event draft is created.
+
 ### Canonical hashing
 
 The hash input includes the complete event envelope except `event_hash`, serialized with deterministic JSON key ordering and compact separators. SHA-256 is used for the M0 chain.
 
-The M0.1 chain is an **internal consistency mechanism**, not an external authenticity anchor. Verification can detect malformed rows, broken hash links, and content changes whose affected hashes were not recomputed. An actor with arbitrary write access can instead rewrite records and recompute the entire affected chain, or truncate the current tail, while preserving local consistency. Detecting that stronger adversary requires a future external checkpoint, signature, replicated witness, or equivalent trust anchor.
+The M0.1 chain is an **internal consistency mechanism**, not an external authenticity anchor. Verification can detect malformed rows, non-contiguous sequence state, broken hash links, and content changes whose affected hashes were not recomputed. An actor with arbitrary write access can instead rewrite or renumber records and recompute the entire affected chain, or truncate the current tail, while preserving local consistency. Detecting that stronger adversary requires a future external checkpoint, signature, replicated witness, or equivalent trust anchor.
 
 ### Storage enforcement
 
 SQLite serializes append operations with an immediate transaction and rejects `UPDATE` and `DELETE` on the event table using database triggers.
 
-Read-only inspection and verification open only an existing initialized ledger and never create schema or files as a side effect.
+The v1 ledger schema has a version marker and an exact expected set of user-defined tables, indexes, and immutability triggers. Existing storage is validated before append. Unexpected schema objects, missing or modified guards, unsupported schema versions, and lookalike databases fail closed.
 
-`ledger verify` recomputes the chain independently to validate the stored ledger against its own canonical event contents and linkage. Its result is a statement about current local consistency, not proof that no privileged writer has ever replaced the history.
+Initialization creates a new ledger or validates an already valid v1 ledger. It does not repair or migrate damaged storage. Read-only inspection and verification likewise open only an existing initialized ledger and never create schema or files as a side effect.
+
+`ledger verify` streams the event history, checks contiguous sequence state, reconstructs canonical event hashes, and validates chain linkage. Its result is a statement about current local consistency, not proof that no privileged writer has ever replaced the history.
 
 ## M0 acceptance scenario
 
@@ -168,13 +180,16 @@ with explicit causal/provenance paths.
 
 M0.1 is complete when:
 
-1. event append is transactional;
-2. event order is deterministic;
-3. historical rows cannot be updated or deleted through normal database access;
-4. hash-chain verification succeeds for valid local history;
-5. verification fails on malformed rows, broken chain links, and modified event content when the stored hashes were not recomputed consistently;
-6. read-only inspection/verification do not initialize missing or unrelated databases;
-7. duplicate event IDs are rejected;
-8. the CLI can initialize, append, display, and verify a ledger;
-9. the trust boundary of the unanchored local hash chain is documented explicitly;
-10. CI executes lint and tests on pull requests.
+1. event append is transactional and persists exactly one accepted event;
+2. event sequence is deterministic and contiguous from `1..N`;
+3. event payload and actor metadata are JSON-native before persistence;
+4. historical rows cannot be updated or deleted through normal database access;
+5. valid v1 ledger schema identity is versioned and checked before mutation;
+6. initialization is creation-only/idempotent for valid storage and does not repair unknown or damaged databases;
+7. hash-chain verification succeeds for valid local history;
+8. verification fails on malformed rows, sequence gaps, broken chain links, and modified event content when stored hashes were not recomputed consistently;
+9. read-only inspection/verification do not initialize missing or unrelated databases;
+10. duplicate event IDs are rejected;
+11. the CLI can initialize, append, display, and verify a ledger and handles invalid input without tracebacks;
+12. the trust boundary of the unanchored local hash chain is documented explicitly;
+13. CI executes lint and tests on pull requests.
