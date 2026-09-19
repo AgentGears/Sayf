@@ -324,40 +324,6 @@ class SQLiteEventStore:
                     previous_hash,
                 )
 
-            if raw_occurred_at != event.occurred_at.isoformat():
-                return (
-                    LedgerVerification(
-                        valid=False,
-                        checked_events=checked_events,
-                        failure_sequence=event.sequence,
-                        reason="stored event timestamp is not canonical",
-                    ),
-                    events,
-                    previous_hash,
-                )
-            if raw_actor_json != canonical_actor_json:
-                return (
-                    LedgerVerification(
-                        valid=False,
-                        checked_events=checked_events,
-                        failure_sequence=event.sequence,
-                        reason="stored actor JSON is not canonical",
-                    ),
-                    events,
-                    previous_hash,
-                )
-            if raw_payload_json != canonical_payload_json:
-                return (
-                    LedgerVerification(
-                        valid=False,
-                        checked_events=checked_events,
-                        failure_sequence=event.sequence,
-                        reason="stored payload JSON is not canonical",
-                    ),
-                    events,
-                    previous_hash,
-                )
-
             expected_sequence = checked_events + 1
             if event.sequence != expected_sequence:
                 return (
@@ -424,6 +390,40 @@ class SQLiteEventStore:
                     previous_hash,
                 )
 
+            if raw_occurred_at != event.occurred_at.isoformat():
+                return (
+                    LedgerVerification(
+                        valid=False,
+                        checked_events=checked_events,
+                        failure_sequence=event.sequence,
+                        reason="stored event timestamp is not canonical",
+                    ),
+                    events,
+                    previous_hash,
+                )
+            if raw_actor_json != canonical_actor_json:
+                return (
+                    LedgerVerification(
+                        valid=False,
+                        checked_events=checked_events,
+                        failure_sequence=event.sequence,
+                        reason="stored actor JSON is not canonical",
+                    ),
+                    events,
+                    previous_hash,
+                )
+            if raw_payload_json != canonical_payload_json:
+                return (
+                    LedgerVerification(
+                        valid=False,
+                        checked_events=checked_events,
+                        failure_sequence=event.sequence,
+                        reason="stored payload JSON is not canonical",
+                    ),
+                    events,
+                    previous_hash,
+                )
+
             previous_hash = event.event_hash
             checked_events += 1
             if collect_events:
@@ -475,8 +475,10 @@ class SQLiteEventStore:
             "SELECT key, value FROM sayf_ledger_meta ORDER BY key"
         ).fetchall()
         metadata = [(str(row["key"]), str(row["value"])) for row in metadata_rows]
-        if metadata != [("schema_version", _LEDGER_SCHEMA_VERSION)]:
+        if len(metadata) != 1 or metadata[0][0] != "schema_version":
             raise LedgerReadError("Sayf ledger metadata is unsupported or malformed")
+        if metadata[0][1] != _LEDGER_SCHEMA_VERSION:
+            raise LedgerReadError("Sayf ledger schema version is unsupported")
 
         rows = connection.execute(
             """
