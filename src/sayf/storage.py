@@ -41,6 +41,18 @@ BEGIN
 END;
 """
 
+_REQUIRED_EVENT_COLUMNS = {
+    "sequence",
+    "event_id",
+    "stream_id",
+    "event_type",
+    "occurred_at",
+    "actor_json",
+    "payload_json",
+    "previous_event_hash",
+    "event_hash",
+}
+
 
 class SQLiteEventStore:
     """Append-only SQLite store for the authoritative Sayf event ledger."""
@@ -49,8 +61,17 @@ class SQLiteEventStore:
         self.path = Path(path)
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
+    def _connect(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
+        if read_only:
+            database = f"{self.path.resolve().as_uri()}?mode=ro"
+            connection = sqlite3.connect(
+                database,
+                timeout=30.0,
+                isolation_level=None,
+                uri=True,
+            )
+        else:
+            connection = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
@@ -124,9 +145,51 @@ class SQLiteEventStore:
         return [self._row_to_event(row) for row in rows]
 
     def verify(self) -> LedgerVerification:
-        self.initialize()
-        with self._connect() as connection:
-            rows = connection.execute("SELECT * FROM events ORDER BY sequence").fetchall()
+        if not self.path.exists():
+            return LedgerVerification(
+                valid=False,
+                checked_events=0,
+                reason="ledger database does not exist",
+            )
+        if not self.path.is_file():
+            return LedgerVerification(
+                valid=False,
+                checked_events=0,
+                reason="ledger database path is not a file",
+            )
+
+        try:
+            with self._connect(read_only=True) as connection:
+                table = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'"
+                ).fetchone()
+                if table is None:
+                    return LedgerVerification(
+                        valid=False,
+                        checked_events=0,
+                        reason="Sayf ledger schema is not initialized",
+                    )
+
+                columns = {
+                    str(row["name"])
+                    for row in connection.execute("PRAGMA table_info(events)").fetchall()
+                }
+                if not _REQUIRED_EVENT_COLUMNS.issubset(columns):
+                    return LedgerVerification(
+                        valid=False,
+                        checked_events=0,
+                        reason="Sayf ledger schema is incomplete",
+                    )
+
+                rows = connection.execute(
+                    "SELECT * FROM events ORDER BY sequence"
+                ).fetchall()
+        except sqlite3.Error as exc:
+            return LedgerVerification(
+                valid=False,
+                checked_events=0,
+                reason=f"unable to read ledger database: {exc}",
+            )
 
         previous_hash: str | None = None
         checked_events = 0
