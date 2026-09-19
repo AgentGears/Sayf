@@ -7,6 +7,8 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from sayf.domain import Actor, EventDraft, LedgerEvent, LedgerVerification
 from sayf.hashing import canonical_json, compute_event_hash
 
@@ -122,10 +124,25 @@ class SQLiteEventStore:
         return [self._row_to_event(row) for row in rows]
 
     def verify(self) -> LedgerVerification:
-        events = self.events()
-        previous_hash: str | None = None
+        self.initialize()
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM events ORDER BY sequence").fetchall()
 
-        for event in events:
+        previous_hash: str | None = None
+        checked_events = 0
+
+        for row in rows:
+            sequence = int(row["sequence"])
+            try:
+                event = self._row_to_event(row)
+            except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as exc:
+                return LedgerVerification(
+                    valid=False,
+                    checked_events=checked_events,
+                    failure_sequence=sequence,
+                    reason=f"malformed event row: {exc}",
+                )
+
             draft = EventDraft(
                 event_id=event.event_id,
                 stream_id=event.stream_id,
@@ -143,7 +160,7 @@ class SQLiteEventStore:
             if event.previous_event_hash != previous_hash:
                 return LedgerVerification(
                     valid=False,
-                    checked_events=event.sequence - 1,
+                    checked_events=checked_events,
                     failure_sequence=event.sequence,
                     reason="previous event hash does not match chain head",
                 )
@@ -151,14 +168,15 @@ class SQLiteEventStore:
             if event.event_hash != expected_hash:
                 return LedgerVerification(
                     valid=False,
-                    checked_events=event.sequence - 1,
+                    checked_events=checked_events,
                     failure_sequence=event.sequence,
                     reason="event hash does not match canonical event content",
                 )
 
             previous_hash = event.event_hash
+            checked_events += 1
 
-        return LedgerVerification(valid=True, checked_events=len(events))
+        return LedgerVerification(valid=True, checked_events=checked_events)
 
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> LedgerEvent:
