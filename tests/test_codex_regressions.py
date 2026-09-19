@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 
 import pytest
 import typer
@@ -10,6 +11,11 @@ from sayf.cli import _parse_payload, app
 from sayf.storage import SQLiteEventStore
 
 runner = CliRunner()
+
+
+def _parser_recursion_payload() -> str:
+    depth = sys.getrecursionlimit() * 4
+    return '{"value":' + "[" * depth + "0" + "]" * depth + "}"
 
 
 @pytest.mark.parametrize("sequence", [0, -1])
@@ -50,15 +56,12 @@ def test_verify_nonpositive_sequence_fails_closed(tmp_path, sequence: int) -> No
 
 
 def test_parse_payload_converts_deep_recursion_to_bad_parameter() -> None:
-    payload = '{"value":' + "[" * 2000 + "0" + "]" * 2000 + "}"
-
     with pytest.raises(typer.BadParameter, match="payload is not valid strict JSON"):
-        _parse_payload(payload)
+        _parse_payload(_parser_recursion_payload())
 
 
 def test_cli_rejects_deeply_nested_payload_without_traceback(tmp_path) -> None:
     db = tmp_path / "ledger.sqlite3"
-    payload = '{"value":' + "[" * 2000 + "0" + "]" * 2000 + "}"
 
     result = runner.invoke(
         app,
@@ -68,7 +71,7 @@ def test_cli_rejects_deeply_nested_payload_without_traceback(tmp_path) -> None:
             "--type",
             "RecordCreated",
             "--payload",
-            payload,
+            _parser_recursion_payload(),
             "--db",
             str(db),
         ],
