@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
+from pydantic import ValidationError
 
 from sayf.domain import Actor, ActorKind, EventDraft
 from sayf.ids import uuid7
@@ -24,6 +26,29 @@ def test_uuid7_is_rfc_variant_and_version() -> None:
     value = uuid7()
     assert value.version == 7
     assert value.variant == uuid.RFC_4122
+
+
+def test_event_draft_rejects_timezone_naive_timestamp() -> None:
+    with pytest.raises(ValidationError, match="timezone-aware"):
+        EventDraft(
+            stream_id="project:test",
+            event_type="RecordCreated",
+            actor=Actor(kind=ActorKind.HUMAN, id="tester"),
+            occurred_at=datetime(2026, 9, 19, 12, 0, 0),
+        )
+
+
+def test_event_draft_normalizes_aware_timestamp_to_utc() -> None:
+    riyadh = timezone(timedelta(hours=3))
+    draft = EventDraft(
+        stream_id="project:test",
+        event_type="RecordCreated",
+        actor=Actor(kind=ActorKind.HUMAN, id="tester"),
+        occurred_at=datetime(2026, 9, 19, 12, 0, 0, tzinfo=riyadh),
+    )
+
+    assert draft.occurred_at == datetime(2026, 9, 19, 9, 0, 0, tzinfo=UTC)
+    assert draft.occurred_at.tzinfo is UTC
 
 
 def test_append_builds_global_hash_chain(tmp_path) -> None:
@@ -70,6 +95,40 @@ def test_verify_detects_tampering_even_if_storage_guard_is_bypassed(tmp_path) ->
     assert result.valid is False
     assert result.failure_sequence == 1
     assert result.reason == "event hash does not match canonical event content"
+
+
+@pytest.mark.parametrize(
+    ("column", "corrupt_value"),
+    [
+        ("actor_json", "{}"),
+        ("payload_json", "{"),
+        ("occurred_at", "not-a-timestamp"),
+    ],
+)
+def test_verify_reports_malformed_rows_as_verification_failures(
+    tmp_path,
+    column: str,
+    corrupt_value: str,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    store.append(_draft("RecordCreated", {"record_id": "r1"}))
+    store.append(_draft("RecordCreated", {"record_id": "r2"}))
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TRIGGER events_no_update")
+        connection.execute(
+            f"UPDATE events SET {column} = ? WHERE sequence = 2",
+            (corrupt_value,),
+        )
+        connection.commit()
+
+    result = store.verify()
+    assert result.valid is False
+    assert result.checked_events == 1
+    assert result.failure_sequence == 2
+    assert result.reason is not None
+    assert result.reason.startswith("malformed event row:")
 
 
 def test_duplicate_event_id_is_rejected(tmp_path) -> None:
