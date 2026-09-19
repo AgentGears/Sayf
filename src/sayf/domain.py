@@ -168,5 +168,5 @@ class LedgerVerification(BaseModel):
 
     valid: bool
     checked_events: int = Field(ge=0)
-    failure_sequence: int | None = Field(default=None, ge=1)
+    failure_sequence: int | None = None
     reason: str | None = None
