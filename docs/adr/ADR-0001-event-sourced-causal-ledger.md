@@ -15,10 +15,15 @@ Sayf will use an append-only event ledger as the authoritative history for M0.
 For the initial implementation:
 
 - SQLite stores the ordered ledger;
-- event payloads are immutable after append through database guards;
+- event payloads and actor metadata are normalized to JSON-native values before persistence;
+- stored timestamps and JSON documents use a canonical representation;
+- a versioned exact schema identifies a supported Sayf v1 ledger;
+- SQLite `quick_check` validates the local database container before authoritative use;
+- database triggers reject event updates and deletes during normal access;
 - a global unkeyed SHA-256 hash chain provides an internal chain-consistency check;
-- independent verification detects malformed rows, broken links, and content rewrites when stored hashes were not recomputed consistently;
-- database triggers reject event updates and deletes;
+- verification checks contiguous `1..N` sequence state, canonical stored representations, hash linkage, and canonical event hashes;
+- initialization, authoritative listing, and append fail closed when existing local history is invalid;
+- append re-verifies the existing local ledger under the same immediate write transaction before extending it;
 - read-only inspection and verification never initialize or mutate a missing database;
 - current state is derived from events rather than stored as mutable semantic truth;
 - larger immutable artifacts will use content-addressed filesystem storage in M0.2;
@@ -28,9 +33,9 @@ For the initial implementation:
 
 The M0.1 local hash chain is **not an authenticity proof** against an adversary with arbitrary write access to the SQLite database.
 
-An actor who can bypass the database guards can modify one or more events and recompute the modified event hash plus every descendant `previous_event_hash`/`event_hash`, yielding a self-consistent chain that local verification cannot distinguish from the original. The same trust limitation applies to truncating the current tail.
+An actor who can bypass the database guards can modify, remove, insert, or renumber events and recompute the affected hash chain, yielding a self-consistent ledger that local verification cannot distinguish from an originally accepted history. The same trust limitation applies to truncating the current tail.
 
-Therefore M0.1 guarantees only that the stored ledger is internally self-consistent with its own hashes and schema. It can detect accidental corruption, malformed records, unrecomputed rewrites, and broken chain links. It cannot prove that the current self-consistent ledger is the same ledger previously observed by an external party.
+Therefore M0.1 establishes **local usability and consistency**, not externally anchored historical authenticity. It detects SQLite integrity failures surfaced by `quick_check`, unsupported or altered local schema, malformed records, noncanonical stored representations, sequence gaps, broken links, and content rewrites whose affected hashes were not recomputed consistently. It cannot prove that the current self-consistent ledger is the same ledger previously observed by an external party.
 
 Authenticity after local-store compromise requires an externally anchored mechanism such as a signed checkpoint, independently stored chain head, replicated witness, transparency log, or equivalent trust anchor. That capability is deliberately deferred beyond M0.1.
 
@@ -44,21 +49,27 @@ A graph database, distributed log, ORM, or event-streaming platform would add in
 
 ### Positive
 
-- complete local history can be replayed;
-- malformed rows, unrecomputed content changes, and interior chain discontinuities are detectable by independent verification;
-- supersession and invalidation can be expressed without rewriting old state;
+- complete locally valid history can be replayed;
+- authoritative reads and writes fail closed on a locally invalid ledger;
+- malformed rows, noncanonical storage, sequence gaps, unrecomputed content changes, and chain discontinuities are detected before authoritative use;
+- unknown or damaged databases are not silently repaired or converted;
+- supersession and invalidation can later be expressed without rewriting old semantic state;
 - adapters do not need an LLM to inspect authoritative history;
 - later projections can be rebuilt from source events;
 - read operations do not silently create authoritative state.
 
 ### Negative
 
-- schema evolution must be explicit;
+- schema evolution must be explicit and versioned;
 - projections must be rebuildable and version-aware;
+- M0.1 append re-verifies the full existing event history, making each append O(N) in ledger length and a sequence of N appends O(N²) overall;
+- SQLite integrity checking adds additional local I/O before authoritative use;
 - distributed multi-writer operation is deferred;
 - the local hash chain alone does not authenticate history after arbitrary local database compromise;
 - malicious recomputation of a modified chain and ledger-tail truncation are not detectable without an external trust anchor;
 - external checkpoint/signature/witness design is deferred.
+
+The O(N) pre-append verification cost is intentional for M0.1: correctness and a simple authority boundary take precedence over throughput while the causal semantics are being proven. Any later optimization must preserve fail-closed behavior, for example through authenticated/validated checkpoints or another mechanism that does not silently trust an unverified head.
 
 ## Alternatives considered
 
@@ -78,10 +89,14 @@ Rejected because graph traversal is needed, but a graph database is not. SQLite 
 
 Deferred until there is evidence that local SQLite semantics are insufficient.
 
+### Trusting the stored chain head on append
+
+Rejected for M0.1 because schema-valid storage can still contain locally invalid history. Extending an unverified head would let corrupted local history become the basis for new authoritative state.
+
 ### External checkpointing in M0.1
 
 Deferred because M0.1 is proving the local event and provenance semantics first. A future milestone can add authenticated checkpoints without changing the meaning of historical events.
 
 ## Revisit trigger
 
-Revisit the storage/trust design when measured requirements demonstrate that single-node SQLite cannot meet required concurrency, durability, graph traversal, deployment, or integrity requirements without distorting the domain model. Any requirement to authenticate history after arbitrary local-store compromise is an explicit trigger to add external checkpointing, signing, witnessing, or an equivalent trust mechanism.
+Revisit the storage/trust design when measured requirements demonstrate that single-node SQLite or full pre-append verification cannot meet required concurrency, durability, graph traversal, deployment, or integrity requirements without distorting the domain model. Any requirement to authenticate history after arbitrary local-store compromise is an explicit trigger to add external checkpointing, signing, witnessing, or an equivalent trust mechanism.
