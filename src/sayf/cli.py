@@ -37,7 +37,7 @@ def _parse_payload(payload: str) -> dict[str, Any]:
             parse_constant=_reject_json_constant,
             object_pairs_hook=_unique_json_object,
         )
-    except (json.JSONDecodeError, ValueError) as exc:
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
         raise typer.BadParameter(f"payload is not valid strict JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise typer.BadParameter("payload must be a JSON object")
