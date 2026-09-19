@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from sayf.domain import Actor, ActorKind, EventDraft
 from sayf.ids import uuid7
-from sayf.storage import SQLiteEventStore
+from sayf.storage import LedgerReadError, SQLiteEventStore
 
 
 def _draft(event_type: str, payload: dict[str, object] | None = None) -> EventDraft:
@@ -63,6 +63,16 @@ def test_verify_missing_database_fails_without_creating_it(tmp_path) -> None:
     assert path.exists() is False
 
 
+def test_events_missing_database_fails_without_creating_it(tmp_path) -> None:
+    path = tmp_path / "missing-ledger.sqlite3"
+    store = SQLiteEventStore(path)
+
+    with pytest.raises(LedgerReadError, match="ledger database does not exist"):
+        store.events()
+
+    assert path.exists() is False
+
+
 def test_verify_uninitialized_database_fails_without_mutating_schema(tmp_path) -> None:
     path = tmp_path / "not-a-ledger.sqlite3"
     with sqlite3.connect(path) as connection:
@@ -74,6 +84,22 @@ def test_verify_uninitialized_database_fails_without_mutating_schema(tmp_path) -
     assert result.valid is False
     assert result.checked_events == 0
     assert result.reason == "Sayf ledger schema is not initialized"
+    with sqlite3.connect(path) as connection:
+        events_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'"
+        ).fetchone()
+    assert events_table is None
+
+
+def test_events_uninitialized_database_fails_without_mutating_schema(tmp_path) -> None:
+    path = tmp_path / "not-a-ledger.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+        connection.commit()
+
+    with pytest.raises(LedgerReadError, match="Sayf ledger schema is not initialized"):
+        SQLiteEventStore(path).events()
+
     with sqlite3.connect(path) as connection:
         events_table = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'"
@@ -120,7 +146,7 @@ def test_database_rejects_update_and_delete(tmp_path) -> None:
             connection.execute("DELETE FROM events WHERE sequence = 1")
 
 
-def test_verify_detects_tampering_even_if_storage_guard_is_bypassed(tmp_path) -> None:
+def test_verify_detects_unrecomputed_rewrite_after_storage_guard_bypass(tmp_path) -> None:
     path = tmp_path / "ledger.sqlite3"
     store = SQLiteEventStore(path)
     store.append(_draft("RecordCreated", {"record_id": "r1"}))
@@ -146,6 +172,7 @@ def test_verify_detects_tampering_even_if_storage_guard_is_bypassed(tmp_path) ->
         ("actor_json", "{}"),
         ("payload_json", "{"),
         ("occurred_at", "not-a-timestamp"),
+        ("occurred_at", "0001-01-01T00:00:00+14:00"),
         ("event_type", ""),
     ],
 )
@@ -171,6 +198,28 @@ def test_verify_reports_malformed_rows_as_verification_failures(
     assert result.valid is False
     assert result.checked_events == 1
     assert result.failure_sequence == 2
+    assert result.reason is not None
+    assert result.reason.startswith("malformed event row:")
+
+
+def test_verify_reports_deeply_nested_json_as_verification_failure(tmp_path) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    store.append(_draft("RecordCreated", {"record_id": "r1"}))
+
+    nested_json = "[" * 2000 + "0" + "]" * 2000
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TRIGGER events_no_update")
+        connection.execute(
+            "UPDATE events SET payload_json = ? WHERE sequence = 1",
+            (nested_json,),
+        )
+        connection.commit()
+
+    result = store.verify()
+    assert result.valid is False
+    assert result.checked_events == 0
+    assert result.failure_sequence == 1
     assert result.reason is not None
     assert result.reason.startswith("malformed event row:")
 
