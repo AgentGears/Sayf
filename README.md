@@ -41,7 +41,7 @@ Sayf is intended to integrate with systems such as Spec Kit and Aegis rather tha
 
 M0 establishes the substrate beneath the control plane:
 
-- **M0.1 Immutable Ledger** — append-only events, actors, local hash-chain consistency, SQLite persistence, replay/verification.
+- **M0.1 Immutable Ledger** — append-only events, actors, local consistency verification, SQLite persistence, replay/verification.
 - **M0.2 Typed Records + Graph** — records, relations, artifacts, traversal.
 - **M0.3 Revision + Staleness** — supersession and dependency invalidation.
 - **M0.4 Evidence + Gates** — verification receipts, policy snapshots, gate decisions.
@@ -68,13 +68,15 @@ sayf ledger show
 sayf ledger verify
 ```
 
-M0.1 accepts JSON-native event payload and actor metadata values only. Non-finite numbers, non-JSON Python objects, duplicate CLI JSON keys, and non-standard JSON constants are rejected before authoritative state is created.
+M0.1 accepts JSON-native event payload and actor metadata values only. Non-finite numbers, non-JSON Python objects, invalid UTF-8 text, duplicate CLI JSON keys, and non-standard JSON constants are rejected before authoritative state is created.
 
-The SQLite ledger uses a versioned exact schema identity and rejects event updates and deletes at the database layer. `sayf init` creates a new ledger or validates an already valid one; it does not silently repair, migrate, or convert an existing unknown or damaged database. Read-only commands such as `sayf ledger show` and `sayf ledger verify` likewise require an existing initialized ledger and do not create one as a side effect.
+A ledger is considered locally usable only after three layers pass: SQLite `quick_check`, exact supported v1 schema/metadata identity, and canonical event-history verification. Stored JSON and timestamps must retain their canonical representation, sequence numbers must be contiguous from `1..N`, and every event hash/link must recompute correctly.
 
-`sayf ledger verify` independently recomputes the canonical local hash chain and validates contiguous event sequence state to check **internal ledger consistency**. It detects malformed rows, broken links, sequence gaps, and corruption or rewrites when the stored hashes were not recomputed consistently.
+`sayf init` creates a new ledger or validates the complete local usability of an existing one; it does not silently repair, migrate, or convert an unknown, damaged, or history-invalid database. `sayf ledger show` returns only locally verified history. `sayf ledger append` re-verifies the existing ledger inside the immediate write transaction before extending it, so new authoritative state is never appended to a locally invalid chain.
 
-M0.1 does **not** claim cryptographic authenticity against an adversary with arbitrary write access to the database: such an actor can rewrite records and recompute every affected hash, renumber history, or truncate the ledger tail while leaving a self-consistent local ledger. Detecting that class of attack requires an external checkpoint, signature, replicated witness, or equivalent trust anchor. ADR-0001 records this boundary explicitly.
+That correctness-first append policy is deliberately O(N) in current ledger length for M0.1. It is suitable for proving the causal semantics, but a later optimization will be needed before high-throughput use. Any such optimization must preserve fail-closed verification, for example through authenticated or otherwise validated checkpoints rather than blindly trusting a stored head.
+
+M0.1 does **not** claim cryptographic authenticity against an adversary with arbitrary write access to the database: such an actor can rewrite records and recompute every affected hash, renumber history, or truncate the ledger tail while leaving a self-consistent local ledger. Detecting that class of attack requires an external checkpoint, signature, replicated witness, transparency log, or equivalent trust anchor. ADR-0001 records this boundary explicitly.
 
 ## Design invariants
 
@@ -84,7 +86,7 @@ M0.1 does **not** claim cryptographic authenticity against an adversary with arb
 4. **No stale reuse** — authoritative decisions bind exact versions of their inputs.
 5. **No hidden downstream impact** — invalidated premises must be traceable to affected decisions and releases.
 6. **Unknown is not pass** — missing evidence is not successful evidence.
-7. **Unknown storage is fail-closed** — existing authority stores are validated before mutation.
+7. **Unknown storage is fail-closed** — existing authority stores are validated before authoritative read or mutation.
 
 ## Development
 
@@ -93,6 +95,8 @@ python -m pip install -e '.[dev]'
 ruff check .
 pytest
 ```
+
+CI executes the suite on Python 3.12 under both Ubuntu and Windows.
 
 See [`docs/architecture/VISION.md`](docs/architecture/VISION.md), [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md), and [`docs/architecture/M0_CAUSAL_LEDGER.md`](docs/architecture/M0_CAUSAL_LEDGER.md).
 
