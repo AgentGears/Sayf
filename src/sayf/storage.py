@@ -15,15 +15,14 @@ from sayf.hashing import canonical_json, compute_event_hash
 _LEDGER_SCHEMA_VERSION = "1"
 _IMMUTABILITY_MESSAGE = "Sayf ledger events are immutable"
 
-_SCHEMA = f"""
+_META_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS sayf_ledger_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
-);
+)
+"""
 
-INSERT OR IGNORE INTO sayf_ledger_meta (key, value)
-VALUES ('schema_version', '{_LEDGER_SCHEMA_VERSION}');
-
+_EVENTS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS events (
     sequence INTEGER PRIMARY KEY,
     event_id TEXT NOT NULL UNIQUE,
@@ -34,65 +33,59 @@ CREATE TABLE IF NOT EXISTS events (
     payload_json TEXT NOT NULL,
     previous_event_hash TEXT,
     event_hash TEXT NOT NULL UNIQUE
-);
+)
+"""
 
+_STREAM_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_events_stream_sequence
-    ON events(stream_id, sequence);
+    ON events(stream_id, sequence)
+"""
 
+_UPDATE_TRIGGER_SQL = f"""
 CREATE TRIGGER IF NOT EXISTS events_no_update
 BEFORE UPDATE ON events
 BEGIN
     SELECT RAISE(ABORT, '{_IMMUTABILITY_MESSAGE}');
-END;
+END
+"""
 
+_DELETE_TRIGGER_SQL = f"""
 CREATE TRIGGER IF NOT EXISTS events_no_delete
 BEFORE DELETE ON events
 BEGIN
     SELECT RAISE(ABORT, '{_IMMUTABILITY_MESSAGE}');
-END;
+END
 """
 
-_EXPECTED_EVENT_COLUMNS = {
-    "sequence": ("INTEGER", False, True),
-    "event_id": ("TEXT", True, False),
-    "stream_id": ("TEXT", True, False),
-    "event_type": ("TEXT", True, False),
-    "occurred_at": ("TEXT", True, False),
-    "actor_json": ("TEXT", True, False),
-    "payload_json": ("TEXT", True, False),
-    "previous_event_hash": ("TEXT", False, False),
-    "event_hash": ("TEXT", True, False),
-}
+_SCHEMA = f"""
+{_META_TABLE_SQL};
 
-_EXPECTED_UNIQUE_COLUMN_SETS = {frozenset({"event_id"}), frozenset({"event_hash"})}
+INSERT OR IGNORE INTO sayf_ledger_meta (key, value)
+VALUES ('schema_version', '{_LEDGER_SCHEMA_VERSION}');
+
+{_EVENTS_TABLE_SQL};
+{_STREAM_INDEX_SQL};
+{_UPDATE_TRIGGER_SQL};
+{_DELETE_TRIGGER_SQL};
+"""
 
 
 def _normalize_schema_sql(sql: str) -> str:
     normalized = " ".join(sql.strip().split()).lower()
-    normalized = normalized.replace("create trigger if not exists ", "create trigger ")
-    normalized = normalized.replace(";", "")
-    return normalized
+    for object_type in ("table", "index", "trigger"):
+        normalized = normalized.replace(
+            f"create {object_type} if not exists ",
+            f"create {object_type} ",
+        )
+    return normalized.replace(";", "")
 
 
-_EXPECTED_IMMUTABILITY_TRIGGERS = {
-    "events_no_update": _normalize_schema_sql(
-        f"""
-        CREATE TRIGGER events_no_update
-        BEFORE UPDATE ON events
-        BEGIN
-            SELECT RAISE(ABORT, '{_IMMUTABILITY_MESSAGE}');
-        END;
-        """
-    ),
-    "events_no_delete": _normalize_schema_sql(
-        f"""
-        CREATE TRIGGER events_no_delete
-        BEFORE DELETE ON events
-        BEGIN
-            SELECT RAISE(ABORT, '{_IMMUTABILITY_MESSAGE}');
-        END;
-        """
-    ),
+_EXPECTED_SCHEMA_OBJECTS = {
+    ("table", "sayf_ledger_meta"): _normalize_schema_sql(_META_TABLE_SQL),
+    ("table", "events"): _normalize_schema_sql(_EVENTS_TABLE_SQL),
+    ("index", "idx_events_stream_sequence"): _normalize_schema_sql(_STREAM_INDEX_SQL),
+    ("trigger", "events_no_update"): _normalize_schema_sql(_UPDATE_TRIGGER_SQL),
+    ("trigger", "events_no_delete"): _normalize_schema_sql(_DELETE_TRIGGER_SQL),
 }
 
 _MALFORMED_ROW_ERRORS = (
@@ -152,11 +145,45 @@ class SQLiteEventStore:
             raise LedgerReadError(f"unable to read ledger database: {exc}") from exc
 
     def initialize(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
-            connection.executescript(_SCHEMA)
+        created_new_file = False
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.path.exists():
+                if not self.path.is_file():
+                    raise LedgerReadError("ledger database path is not a file")
+                with self._read_connection():
+                    return
+
+            try:
+                with self.path.open("xb"):
+                    pass
+                created_new_file = True
+            except FileExistsError:
+                if not self.path.is_file():
+                    raise LedgerReadError("ledger database path is not a file") from None
+                with self._read_connection():
+                    return
+
+            with self._connect() as connection:
+                connection.executescript(_SCHEMA)
+                self._validate_schema(connection)
+        except LedgerReadError:
+            if created_new_file:
+                self._remove_failed_initialization()
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            if created_new_file:
+                self._remove_failed_initialization()
+            raise LedgerReadError(f"unable to initialize ledger: {exc}") from exc
 
     def append(self, draft: EventDraft) -> LedgerEvent:
+        try:
+            snapshot = EventDraft.model_validate(draft.model_dump(mode="python"))
+            actor_json = canonical_json(snapshot.actor.model_dump(mode="json"))
+            payload_json = canonical_json(snapshot.payload)
+        except (ValidationError, TypeError, ValueError, OverflowError, RecursionError) as exc:
+            raise LedgerReadError(f"event draft is not canonical JSON: {exc}") from exc
+
         try:
             if not self.path.exists():
                 self.initialize()
@@ -173,12 +200,12 @@ class SQLiteEventStore:
                     sequence = 1 if row is None else int(row["sequence"]) + 1
                     previous_hash = None if row is None else str(row["event_hash"])
                     event_hash = compute_event_hash(
-                        draft,
+                        snapshot,
                         sequence=sequence,
                         previous_event_hash=previous_hash,
                     )
 
-                    connection.execute(
+                    cursor = connection.execute(
                         """
                         INSERT INTO events (
                             sequence, event_id, stream_id, event_type, occurred_at,
@@ -187,16 +214,18 @@ class SQLiteEventStore:
                         """,
                         (
                             sequence,
-                            draft.event_id,
-                            draft.stream_id,
-                            draft.event_type,
-                            draft.occurred_at.isoformat(),
-                            canonical_json(draft.actor.model_dump(mode="json")),
-                            canonical_json(draft.payload),
+                            snapshot.event_id,
+                            snapshot.stream_id,
+                            snapshot.event_type,
+                            snapshot.occurred_at.isoformat(),
+                            actor_json,
+                            payload_json,
                             previous_hash,
                             event_hash,
                         ),
                     )
+                    if cursor.rowcount != 1:
+                        raise LedgerReadError("ledger append did not persist exactly one event")
                     connection.execute("COMMIT")
                 except Exception:
                     if connection.in_transaction:
@@ -208,13 +237,13 @@ class SQLiteEventStore:
             raise LedgerReadError(f"unable to append to ledger: {exc}") from exc
 
         return LedgerEvent(
-            event_id=draft.event_id,
+            event_id=snapshot.event_id,
             sequence=sequence,
-            stream_id=draft.stream_id,
-            event_type=draft.event_type,
-            occurred_at=draft.occurred_at,
-            actor=draft.actor,
-            payload=draft.payload,
+            stream_id=snapshot.stream_id,
+            event_type=snapshot.event_type,
+            occurred_at=snapshot.occurred_at,
+            actor=snapshot.actor,
+            payload=snapshot.payload,
             previous_event_hash=previous_hash,
             event_hash=event_hash,
         )
@@ -243,6 +272,29 @@ class SQLiteEventStore:
                     sequence = row["sequence"]
                     try:
                         event = self._row_to_event(row)
+                    except _MALFORMED_ROW_ERRORS as exc:
+                        return LedgerVerification(
+                            valid=False,
+                            checked_events=checked_events,
+                            failure_sequence=(
+                                int(sequence) if isinstance(sequence, int) else None
+                            ),
+                            reason=f"malformed event row: {exc}",
+                        )
+
+                    expected_sequence = checked_events + 1
+                    if event.sequence != expected_sequence:
+                        return LedgerVerification(
+                            valid=False,
+                            checked_events=checked_events,
+                            failure_sequence=event.sequence,
+                            reason=(
+                                "event sequence is not contiguous: "
+                                f"expected {expected_sequence}, found {event.sequence}"
+                            ),
+                        )
+
+                    try:
                         draft = EventDraft(
                             event_id=event.event_id,
                             stream_id=event.stream_id,
@@ -260,9 +312,7 @@ class SQLiteEventStore:
                         return LedgerVerification(
                             valid=False,
                             checked_events=checked_events,
-                            failure_sequence=(
-                                int(sequence) if isinstance(sequence, int) else None
-                            ),
+                            failure_sequence=event.sequence,
                             reason=f"malformed event row: {exc}",
                         )
 
@@ -293,94 +343,55 @@ class SQLiteEventStore:
 
         return LedgerVerification(valid=True, checked_events=checked_events)
 
+    def _remove_failed_initialization(self) -> None:
+        try:
+            self.path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
-        marker_table = connection.execute(
+        marker = connection.execute(
             """
-            SELECT 1 FROM sqlite_master
+            SELECT type, name, sql FROM sqlite_master
             WHERE type = 'table' AND name = 'sayf_ledger_meta'
             """
         ).fetchone()
-        if marker_table is None:
+        if marker is None:
             raise LedgerReadError("Sayf ledger schema marker is missing")
+        if _normalize_schema_sql(str(marker["sql"] or "")) != _EXPECTED_SCHEMA_OBJECTS[
+            ("table", "sayf_ledger_meta")
+        ]:
+            raise LedgerReadError("Sayf ledger schema marker is malformed")
 
-        marker = connection.execute(
+        marker_row = connection.execute(
             "SELECT value FROM sayf_ledger_meta WHERE key = 'schema_version'"
         ).fetchone()
-        if marker is None or str(marker["value"]) != _LEDGER_SCHEMA_VERSION:
+        if marker_row is None or str(marker_row["value"]) != _LEDGER_SCHEMA_VERSION:
             raise LedgerReadError("Sayf ledger schema version is unsupported")
 
-        event_table = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'"
-        ).fetchone()
-        if event_table is None:
-            raise LedgerReadError("Sayf ledger events table is missing")
-
-        column_rows = connection.execute("PRAGMA table_info(events)").fetchall()
-        columns = {str(row["name"]): row for row in column_rows}
-        if set(columns) != set(_EXPECTED_EVENT_COLUMNS):
-            raise LedgerReadError("Sayf ledger events schema has unexpected columns")
-
-        for name, (expected_type, required_not_null, required_pk) in (
-            _EXPECTED_EVENT_COLUMNS.items()
-        ):
-            row = columns[name]
-            if str(row["type"]).upper() != expected_type:
-                raise LedgerReadError(f"Sayf ledger column {name} has unexpected type")
-            if required_not_null and int(row["notnull"]) != 1:
-                raise LedgerReadError(f"Sayf ledger column {name} must be NOT NULL")
-            if required_pk and int(row["pk"]) != 1:
-                raise LedgerReadError(f"Sayf ledger column {name} must be PRIMARY KEY")
-            if not required_pk and int(row["pk"]) != 0:
-                raise LedgerReadError(f"Sayf ledger column {name} has unexpected PK role")
-
-        unique_column_sets: set[frozenset[str]] = set()
-        indexes = connection.execute("PRAGMA index_list(events)").fetchall()
-        stream_index_is_expected = False
-        for index in indexes:
-            index_name_raw = str(index["name"])
-            is_unique = int(index["unique"]) == 1
-            is_partial = int(index["partial"]) == 1
-            origin = str(index["origin"])
-            if index_name_raw == "idx_events_stream_sequence":
-                stream_index_is_expected = (
-                    not is_unique and not is_partial and origin == "c"
-                )
-            if not is_unique or is_partial or origin != "u":
-                continue
-            index_name = index_name_raw.replace("'", "''")
-            index_columns = connection.execute(
-                f"PRAGMA index_info('{index_name}')"
-            ).fetchall()
-            unique_column_sets.add(
-                frozenset(str(row["name"]) for row in index_columns)
+        rows = connection.execute(
+            """
+            SELECT type, name, sql FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%'
+              AND type IN ('table', 'index', 'trigger', 'view')
+            """
+        ).fetchall()
+        actual_objects = {
+            (str(row["type"]), str(row["name"])): _normalize_schema_sql(
+                str(row["sql"] or "")
             )
-        if not _EXPECTED_UNIQUE_COLUMN_SETS.issubset(unique_column_sets):
-            raise LedgerReadError("Sayf ledger unique constraints are incomplete")
-
-        if not stream_index_is_expected:
-            raise LedgerReadError("Sayf ledger stream index is missing or malformed")
-        stream_index_columns = [
-            str(row["name"])
-            for row in connection.execute(
-                "PRAGMA index_info('idx_events_stream_sequence')"
-            ).fetchall()
-        ]
-        if stream_index_columns != ["stream_id", "sequence"]:
-            raise LedgerReadError("Sayf ledger stream index is malformed")
-
-        triggers = {
-            str(row["name"]): _normalize_schema_sql(str(row["sql"] or ""))
-            for row in connection.execute(
-                """
-                SELECT name, sql FROM sqlite_master
-                WHERE type = 'trigger' AND tbl_name = 'events'
-                """
-            ).fetchall()
+            for row in rows
         }
-        for name, expected_sql in _EXPECTED_IMMUTABILITY_TRIGGERS.items():
-            if triggers.get(name) != expected_sql:
-                raise LedgerReadError(f"Sayf ledger trigger {name} is missing or malformed")
+
+        if set(actual_objects) != set(_EXPECTED_SCHEMA_OBJECTS):
+            raise LedgerReadError("Sayf ledger schema objects are unexpected or incomplete")
+
+        for key, expected_sql in _EXPECTED_SCHEMA_OBJECTS.items():
+            if actual_objects[key] != expected_sql:
+                raise LedgerReadError(
+                    f"Sayf ledger schema object {key[1]} is missing or malformed"
+                )
 
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> LedgerEvent:
