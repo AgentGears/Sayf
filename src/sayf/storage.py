@@ -194,11 +194,11 @@ class SQLiteEventStore:
                 try:
                     connection.execute("BEGIN IMMEDIATE")
                     self._validate_schema(connection)
-                    row = connection.execute(
-                        "SELECT sequence, event_hash FROM events ORDER BY sequence DESC LIMIT 1"
-                    ).fetchone()
-                    sequence = 1 if row is None else int(row["sequence"]) + 1
-                    previous_hash = None if row is None else str(row["event_hash"])
+                    verification, _, previous_hash = self._verify_connection(connection)
+                    if not verification.valid:
+                        raise LedgerReadError(self._verification_error(verification))
+
+                    sequence = verification.checked_events + 1
                     event_hash = compute_event_hash(
                         snapshot,
                         sequence=sequence,
@@ -249,99 +249,139 @@ class SQLiteEventStore:
         )
 
     def events(self) -> list[LedgerEvent]:
-        events: list[LedgerEvent] = []
         with self._read_connection() as connection:
-            for row in connection.execute("SELECT * FROM events ORDER BY sequence"):
-                sequence = row["sequence"]
-                try:
-                    events.append(self._row_to_event(row))
-                except _MALFORMED_ROW_ERRORS as exc:
-                    raise LedgerReadError(
-                        f"malformed event row at sequence {sequence}: {exc}"
-                    ) from exc
+            verification, events, _ = self._verify_connection(
+                connection,
+                collect_events=True,
+            )
+        if not verification.valid:
+            raise LedgerReadError(self._verification_error(verification))
         return events
 
     def verify(self) -> LedgerVerification:
-        previous_hash: str | None = None
-        checked_events = 0
-
         try:
             with self._read_connection() as connection:
-                cursor = connection.execute("SELECT * FROM events ORDER BY sequence")
-                for row in cursor:
-                    sequence = row["sequence"]
-                    try:
-                        event = self._row_to_event(row)
-                    except _MALFORMED_ROW_ERRORS as exc:
-                        return LedgerVerification(
-                            valid=False,
-                            checked_events=checked_events,
-                            failure_sequence=(
-                                int(sequence) if isinstance(sequence, int) else None
-                            ),
-                            reason=f"malformed event row: {exc}",
-                        )
-
-                    expected_sequence = checked_events + 1
-                    if event.sequence != expected_sequence:
-                        return LedgerVerification(
-                            valid=False,
-                            checked_events=checked_events,
-                            failure_sequence=event.sequence,
-                            reason=(
-                                "event sequence is not contiguous: "
-                                f"expected {expected_sequence}, found {event.sequence}"
-                            ),
-                        )
-
-                    try:
-                        draft = EventDraft(
-                            event_id=event.event_id,
-                            stream_id=event.stream_id,
-                            event_type=event.event_type,
-                            occurred_at=event.occurred_at,
-                            actor=event.actor,
-                            payload=event.payload,
-                        )
-                        expected_hash = compute_event_hash(
-                            draft,
-                            sequence=event.sequence,
-                            previous_event_hash=previous_hash,
-                        )
-                    except _MALFORMED_ROW_ERRORS as exc:
-                        return LedgerVerification(
-                            valid=False,
-                            checked_events=checked_events,
-                            failure_sequence=event.sequence,
-                            reason=f"malformed event row: {exc}",
-                        )
-
-                    if event.previous_event_hash != previous_hash:
-                        return LedgerVerification(
-                            valid=False,
-                            checked_events=checked_events,
-                            failure_sequence=event.sequence,
-                            reason="previous event hash does not match chain head",
-                        )
-
-                    if event.event_hash != expected_hash:
-                        return LedgerVerification(
-                            valid=False,
-                            checked_events=checked_events,
-                            failure_sequence=event.sequence,
-                            reason="event hash does not match canonical event content",
-                        )
-
-                    previous_hash = event.event_hash
-                    checked_events += 1
+                verification, _, _ = self._verify_connection(connection)
+                return verification
         except LedgerReadError as exc:
             return LedgerVerification(
                 valid=False,
-                checked_events=checked_events,
+                checked_events=0,
                 reason=str(exc),
             )
 
-        return LedgerVerification(valid=True, checked_events=checked_events)
+    def _verify_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        collect_events: bool = False,
+    ) -> tuple[LedgerVerification, list[LedgerEvent], str | None]:
+        previous_hash: str | None = None
+        checked_events = 0
+        events: list[LedgerEvent] = []
+        cursor = connection.execute("SELECT * FROM events ORDER BY sequence")
+
+        for row in cursor:
+            sequence = row["sequence"]
+            try:
+                event = self._row_to_event(row)
+            except _MALFORMED_ROW_ERRORS as exc:
+                return (
+                    LedgerVerification(
+                        valid=False,
+                        checked_events=checked_events,
+                        failure_sequence=(int(sequence) if isinstance(sequence, int) else None),
+                        reason=f"malformed event row: {exc}",
+                    ),
+                    events,
+                    previous_hash,
+                )
+
+            expected_sequence = checked_events + 1
+            if event.sequence != expected_sequence:
+                return (
+                    LedgerVerification(
+                        valid=False,
+                        checked_events=checked_events,
+                        failure_sequence=event.sequence,
+                        reason=(
+                            "event sequence is not contiguous: "
+                            f"expected {expected_sequence}, found {event.sequence}"
+                        ),
+                    ),
+                    events,
+                    previous_hash,
+                )
+
+            try:
+                draft = EventDraft(
+                    event_id=event.event_id,
+                    stream_id=event.stream_id,
+                    event_type=event.event_type,
+                    occurred_at=event.occurred_at,
+                    actor=event.actor,
+                    payload=event.payload,
+                )
+                expected_hash = compute_event_hash(
+                    draft,
+                    sequence=event.sequence,
+                    previous_event_hash=previous_hash,
+                )
+            except _MALFORMED_ROW_ERRORS as exc:
+                return (
+                    LedgerVerification(
+                        valid=False,
+                        checked_events=checked_events,
+                        failure_sequence=event.sequence,
+                        reason=f"malformed event row: {exc}",
+                    ),
+                    events,
+                    previous_hash,
+                )
+
+            if event.previous_event_hash != previous_hash:
+                return (
+                    LedgerVerification(
+                        valid=False,
+                        checked_events=checked_events,
+                        failure_sequence=event.sequence,
+                        reason="previous event hash does not match chain head",
+                    ),
+                    events,
+                    previous_hash,
+                )
+
+            if event.event_hash != expected_hash:
+                return (
+                    LedgerVerification(
+                        valid=False,
+                        checked_events=checked_events,
+                        failure_sequence=event.sequence,
+                        reason="event hash does not match canonical event content",
+                    ),
+                    events,
+                    previous_hash,
+                )
+
+            previous_hash = event.event_hash
+            checked_events += 1
+            if collect_events:
+                events.append(event)
+
+        return (
+            LedgerVerification(valid=True, checked_events=checked_events),
+            events,
+            previous_hash,
+        )
+
+    @staticmethod
+    def _verification_error(verification: LedgerVerification) -> str:
+        if verification.failure_sequence is not None:
+            return (
+                f"ledger verification failed at sequence {verification.failure_sequence}: "
+                f"{verification.reason}"
+            )
+        return f"ledger verification failed: {verification.reason}"
 
     def _remove_failed_initialization(self) -> None:
         try:
