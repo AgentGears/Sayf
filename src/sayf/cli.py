@@ -7,7 +7,7 @@ from typing import Annotated
 import typer
 
 from sayf.domain import Actor, ActorKind, EventDraft
-from sayf.storage import SQLiteEventStore
+from sayf.storage import LedgerReadError, SQLiteEventStore
 
 app = typer.Typer(help="Sayf evidence-driven engineering control plane.")
 ledger_app = typer.Typer(help="Inspect and mutate the append-only causal ledger.")
@@ -55,7 +55,11 @@ def append_event(
 def show_events(
     db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
 ) -> None:
-    events = SQLiteEventStore(db).events()
+    try:
+        events = SQLiteEventStore(db).events()
+    except LedgerReadError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
     typer.echo(json.dumps([event.model_dump(mode="json") for event in events], indent=2))
 
 
