@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
+from pydantic import ValidationError
 
 from sayf.domain import Actor, ActorKind, EventDraft
 from sayf.storage import LedgerReadError, SQLiteEventStore
@@ -16,12 +17,43 @@ app.add_typer(ledger_app, name="ledger")
 DEFAULT_DB = Path(".sayf/ledger.sqlite3")
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant {value}")
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        result[key] = value
+    return result
+
+
+def _parse_payload(payload: str) -> dict[str, Any]:
+    try:
+        value = json.loads(
+            payload,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_unique_json_object,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise typer.BadParameter(f"payload is not valid strict JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise typer.BadParameter("payload must be a JSON object")
+    return value
+
+
 @app.command()
 def init(
     root: Annotated[Path, typer.Argument(help="Project root to initialize.")] = Path("."),
 ) -> None:
     db = root / DEFAULT_DB
-    SQLiteEventStore(db).initialize()
+    try:
+        SQLiteEventStore(db).initialize()
+    except LedgerReadError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
     typer.echo(f"Initialized Sayf ledger at {db}")
 
 
@@ -34,19 +66,17 @@ def append_event(
     payload: Annotated[str, typer.Option("--payload", help="JSON object payload.")] = "{}",
     db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
 ) -> None:
+    payload_value = _parse_payload(payload)
     try:
-        payload_value = json.loads(payload)
-    except json.JSONDecodeError as exc:
-        raise typer.BadParameter(f"payload is not valid JSON: {exc}") from exc
-    if not isinstance(payload_value, dict):
-        raise typer.BadParameter("payload must be a JSON object")
+        draft = EventDraft(
+            stream_id=stream,
+            event_type=event_type,
+            actor=Actor(kind=actor_kind, id=actor_id),
+            payload=payload_value,
+        )
+    except ValidationError as exc:
+        raise typer.BadParameter(f"event fields are invalid: {exc}") from exc
 
-    draft = EventDraft(
-        stream_id=stream,
-        event_type=event_type,
-        actor=Actor(kind=actor_kind, id=actor_id),
-        payload=payload_value,
-    )
     try:
         event = SQLiteEventStore(db).append(draft)
     except LedgerReadError as exc:
