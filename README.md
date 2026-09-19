@@ -68,7 +68,11 @@ sayf ledger show
 sayf ledger verify
 ```
 
-The SQLite ledger rejects event updates and deletes at the database layer. `sayf ledger verify` independently recomputes the canonical hash chain and detects content rewrites and chain discontinuities if those storage guards are bypassed. Because M0.1 has no external checkpoint or trust anchor, deletion of the current ledger tail cannot be proven from the remaining local chain alone; ADR-0001 records that trust-boundary limitation explicitly.
+The SQLite ledger rejects event updates and deletes at the database layer. `sayf ledger verify` independently recomputes the canonical local hash chain to check **internal chain consistency**. It detects corruption or rewrites when the stored hashes were not recomputed consistently.
+
+M0.1 does **not** claim cryptographic authenticity against an adversary with arbitrary write access to the database: such an actor can rewrite records and recompute every affected hash, or truncate the ledger tail, while leaving a self-consistent local chain. Detecting that class of attack requires an external checkpoint, signature, replicated witness, or equivalent trust anchor. ADR-0001 records this boundary explicitly.
+
+Read-only commands such as `sayf ledger show` and `sayf ledger verify` require an existing initialized ledger; they do not create one as a side effect.
 
 ## Design invariants
 
