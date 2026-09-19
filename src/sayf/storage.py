@@ -157,50 +157,55 @@ class SQLiteEventStore:
             connection.executescript(_SCHEMA)
 
     def append(self, draft: EventDraft) -> LedgerEvent:
-        if not self.path.exists():
-            self.initialize()
-        elif not self.path.is_file():
-            raise LedgerReadError("ledger database path is not a file")
+        try:
+            if not self.path.exists():
+                self.initialize()
+            elif not self.path.is_file():
+                raise LedgerReadError("ledger database path is not a file")
 
-        with self._connect() as connection:
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                self._validate_schema(connection)
-                row = connection.execute(
-                    "SELECT sequence, event_hash FROM events ORDER BY sequence DESC LIMIT 1"
-                ).fetchone()
-                sequence = 1 if row is None else int(row["sequence"]) + 1
-                previous_hash = None if row is None else str(row["event_hash"])
-                event_hash = compute_event_hash(
-                    draft,
-                    sequence=sequence,
-                    previous_event_hash=previous_hash,
-                )
+            with self._connect() as connection:
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    self._validate_schema(connection)
+                    row = connection.execute(
+                        "SELECT sequence, event_hash FROM events ORDER BY sequence DESC LIMIT 1"
+                    ).fetchone()
+                    sequence = 1 if row is None else int(row["sequence"]) + 1
+                    previous_hash = None if row is None else str(row["event_hash"])
+                    event_hash = compute_event_hash(
+                        draft,
+                        sequence=sequence,
+                        previous_event_hash=previous_hash,
+                    )
 
-                connection.execute(
-                    """
-                    INSERT INTO events (
-                        sequence, event_id, stream_id, event_type, occurred_at,
-                        actor_json, payload_json, previous_event_hash, event_hash
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        sequence,
-                        draft.event_id,
-                        draft.stream_id,
-                        draft.event_type,
-                        draft.occurred_at.isoformat(),
-                        canonical_json(draft.actor.model_dump(mode="json")),
-                        canonical_json(draft.payload),
-                        previous_hash,
-                        event_hash,
-                    ),
-                )
-                connection.execute("COMMIT")
-            except Exception:
-                if connection.in_transaction:
-                    connection.execute("ROLLBACK")
-                raise
+                    connection.execute(
+                        """
+                        INSERT INTO events (
+                            sequence, event_id, stream_id, event_type, occurred_at,
+                            actor_json, payload_json, previous_event_hash, event_hash
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            sequence,
+                            draft.event_id,
+                            draft.stream_id,
+                            draft.event_type,
+                            draft.occurred_at.isoformat(),
+                            canonical_json(draft.actor.model_dump(mode="json")),
+                            canonical_json(draft.payload),
+                            previous_hash,
+                            event_hash,
+                        ),
+                    )
+                    connection.execute("COMMIT")
+                except Exception:
+                    if connection.in_transaction:
+                        connection.execute("ROLLBACK")
+                    raise
+        except LedgerReadError:
+            raise
+        except sqlite3.Error as exc:
+            raise LedgerReadError(f"unable to append to ledger: {exc}") from exc
 
         return LedgerEvent(
             event_id=draft.event_id,
@@ -331,12 +336,17 @@ class SQLiteEventStore:
 
         unique_column_sets: set[frozenset[str]] = set()
         indexes = connection.execute("PRAGMA index_list(events)").fetchall()
-        stream_index_is_non_unique = False
+        stream_index_is_expected = False
         for index in indexes:
             index_name_raw = str(index["name"])
+            is_unique = int(index["unique"]) == 1
+            is_partial = int(index["partial"]) == 1
+            origin = str(index["origin"])
             if index_name_raw == "idx_events_stream_sequence":
-                stream_index_is_non_unique = int(index["unique"]) == 0
-            if int(index["unique"]) != 1:
+                stream_index_is_expected = (
+                    not is_unique and not is_partial and origin == "c"
+                )
+            if not is_unique or is_partial or origin != "u":
                 continue
             index_name = index_name_raw.replace("'", "''")
             index_columns = connection.execute(
@@ -348,8 +358,8 @@ class SQLiteEventStore:
         if not _EXPECTED_UNIQUE_COLUMN_SETS.issubset(unique_column_sets):
             raise LedgerReadError("Sayf ledger unique constraints are incomplete")
 
-        if not stream_index_is_non_unique:
-            raise LedgerReadError("Sayf ledger stream index is missing or unexpectedly unique")
+        if not stream_index_is_expected:
+            raise LedgerReadError("Sayf ledger stream index is missing or malformed")
         stream_index_columns = [
             str(row["name"])
             for row in connection.execute(
