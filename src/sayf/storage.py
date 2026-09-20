@@ -293,13 +293,29 @@ class SQLiteEventStore:
                 except OSError:
                     pass
 
-    def _clear_pending_initialization_marker(self) -> None:
+    def _establish_pending_marker_absence_durability(self) -> None:
+        marker_path = self._initialization_pending_path
+        if marker_path.exists():
+            raise LedgerReadError("initialization pending marker unexpectedly exists")
         try:
-            self._initialization_pending_path.unlink(missing_ok=True)
-        except OSError:
-            # The ledger is already authoritative at this point. A leftover marker is
-            # safe: the next initializer validates the ledger before clearing it.
-            pass
+            self._fsync_directory(marker_path.parent)
+        except OSError as exc:
+            raise LedgerReadError(
+                "unable to establish initialization pending marker absence durability: "
+                f"{exc}"
+            ) from exc
+        if marker_path.exists():
+            raise LedgerReadError("initialization pending marker appeared during absence sync")
+
+    def _clear_pending_initialization_marker(self) -> None:
+        marker_path = self._initialization_pending_path
+        try:
+            marker_path.unlink(missing_ok=True)
+            self._fsync_directory(marker_path.parent)
+        except OSError as exc:
+            raise LedgerReadError(
+                f"unable to durably revoke initialization pending marker: {exc}"
+            ) from exc
 
     def _validate_recoverable_pending_target(self) -> None:
         try:
@@ -342,6 +358,8 @@ class SQLiteEventStore:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self._initialization_guard():
                 pending = self._pending_initialization_exists()
+                if self.path.exists() and not pending:
+                    self._establish_pending_marker_absence_durability()
 
                 if self.path.exists():
                     if not self.path.is_file():
