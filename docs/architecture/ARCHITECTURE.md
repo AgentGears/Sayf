@@ -47,7 +47,7 @@ The hash chain is global rather than per stream. Verification checks canonical s
 
 The M0.1 hash chain is **not** an authenticity proof against an actor with arbitrary database write access. Such an actor can rewrite or renumber history and recompute the affected chain, or truncate the current tail, while leaving a locally self-consistent ledger. External checkpointing, signing, or witnessing is required to detect that stronger class of attack.
 
-SQLite triggers reject `UPDATE` and `DELETE` against the event table during normal database access. Hash verification is independent of those triggers, but its result remains a statement about local consistency rather than externally anchored authenticity.
+SQLite triggers reject `UPDATE`, `DELETE`, and replacement inserts that collide with an existing event sequence, event ID, or event hash during normal database access. Hash verification is independent of those triggers, but its result remains a statement about local consistency rather than externally anchored authenticity.
 
 ## 4. Persistent state strategy
 
@@ -64,6 +64,8 @@ M0 uses:
 Human-readable projections are never authoritative storage.
 
 Initialization is creation-only and idempotent for an already locally valid ledger. It does not silently repair, migrate, convert, or legitimize an existing unknown, damaged, or history-invalid database. Repair and migration require explicit future operations.
+
+First-use schema creation is executed statement-by-statement inside one SQLite `BEGIN EXCLUSIVE` transaction. Concurrent initializers therefore serialize through SQLite itself, and M0.1 does not require filesystem hard-link support to install a new ledger.
 
 Appending currently re-verifies the complete existing local history inside the immediate write transaction. That is intentionally O(N) per append in M0.1; optimization is deferred until it can preserve the same fail-closed authority boundary.
 
@@ -102,6 +104,7 @@ M0.1 implements the generic immutable event substrate before introducing these h
 - append-only SQLite storage;
 - SQLite container integrity check;
 - versioned exact schema/metadata identity;
+- transactional, filesystem-portable first-use initialization;
 - local history consistency verification;
 - fail-closed authoritative replay/listing and append;
 - CLI and CI tests on Ubuntu and Windows.
