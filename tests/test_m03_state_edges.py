@@ -113,6 +113,16 @@ def test_supersession_source_cannot_directly_supersede_two_records(
         repo.supersede("sup_i2_i0", actor=ACTOR)
 
 
+def test_older_record_cannot_supersede_newer_record(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    record(repo, "older", RecordType.INTENT_REVISION)
+    record(repo, "newer", RecordType.INTENT_REVISION)
+    relation(repo, "sup_backwards", RelationType.SUPERSEDES, "older", "newer")
+
+    with pytest.raises(StateProjectionError, match="must be created after"):
+        repo.supersede("sup_backwards", actor=ACTOR)
+
+
 def test_multiple_invalidation_causes_preserve_activation_order(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     record(repo, "a1", RecordType.ASSUMPTION)
