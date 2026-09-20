@@ -152,15 +152,15 @@ Before an existing ledger is treated as authoritative, M0.1 applies three layers
 
 This gate applies to `init` on an existing ledger, authoritative event listing, and append. An append performs the check under the same `BEGIN IMMEDIATE` transaction before extending the chain, preventing new state from being based on locally invalid history.
 
-Initialization creates a new ledger or validates the complete local usability of an existing one. Before the target path is inspected, first-use operations acquire an exclusive lock in a tiny non-authoritative SQLite coordination sidecar. Only that owner may decide whether the target is missing or pre-existing. If missing, the owner reserves the target with exclusive file creation and creates the schema inside one SQLite transaction. This prevents a concurrent Sayf process from observing another initializer's in-progress target and misclassifying it as unknown pre-existing storage. The coordination sidecar carries no authoritative events or semantic state and requires no filesystem hard-link support.
+Initialization creates a new ledger or validates the complete local usability of an existing one. Before the target path is inspected, first-use operations acquire an exclusive lock in a tiny non-authoritative SQLite coordination sidecar whose fixed-length key is derived from the normalized, case-folded resolved target path. Only that owner may decide whether the target is missing or pre-existing. If missing, the owner writes a small pending-initialization marker, reserves the target with exclusive file creation, and creates the schema inside one SQLite transaction. The marker is operational provenance only; it is not authoritative Sayf state. If the process or host stops before commit, the next lock owner may recover only a marker-backed target that remains schema-less SQLite storage. A target with user schema objects or non-SQLite content is rejected, and an unrelated empty SQLite file without the marker is still not converted. If the target already contains a valid Sayf ledger, a leftover marker is cleared after validation. This prevents a concurrent Sayf process from observing another initializer's in-progress target and misclassifying it as unknown pre-existing storage while also making first-use creation retryable after interruption. The coordination artifacts require no filesystem hard-link support.
 
-An already-existing unknown or empty SQLite file is not silently converted. Initialization does not repair or migrate damaged storage. Read-only inspection and verification never create schema, coordination state, or ledger files as a side effect.
+An already-existing unknown or empty SQLite file is not silently converted. Initialization does not repair or migrate damaged storage. Read-only inspection and verification never create schema, coordination state, pending markers, or ledger files as a side effect.
 
 At the database level, `UPDATE` and `DELETE` are rejected for event rows, and replacement-style inserts are rejected when the incoming row collides with an existing `sequence`, `event_id`, or `event_hash`. These guards protect normal database access; they are not an authenticity boundary against an actor able to alter the schema itself.
 
-`ledger verify` streams the event history rather than materializing the full ledger. Its result is a statement about current local usability and consistency, not proof that no privileged writer has ever replaced the history.
+`ledger verify` streams the event history rather than materializing the full ledger. Structural validation is also bounded: metadata cardinality is determined without materializing arbitrary metadata rows, schema-object enumeration is capped just above the exact expected object count, and SQLite `quick_check` is capped to the first reported result. Its result is a statement about current local usability and consistency, not proof that no privileged writer has ever replaced the history.
 
-The full pre-append scan is deliberately O(N) in ledger length in M0.1. Append also passes through the first-use coordination barrier, whose sidecar contains no authoritative state. This is a correctness-first choice while the causal semantics are being proven. Later checkpoint/caching work may optimize it only if the optimized path preserves fail-closed validation rather than trusting an unauthenticated stored head.
+The full pre-append scan is deliberately O(N) in ledger length in M0.1. Append also passes through the first-use coordination barrier, whose sidecar and pending marker contain no authoritative state. This is a correctness-first choice while the causal semantics are being proven. Later checkpoint/caching work may optimize it only if the optimized path preserves fail-closed validation rather than trusting an unauthenticated stored head.
 
 ## M0 acceptance scenario
 
@@ -198,12 +198,13 @@ M0.1 is complete when:
 4. canonical stored JSON/timestamp representations are independently checked;
 5. historical rows cannot be updated, deleted, or replaced through normal database access by colliding on event sequence, event ID, or event hash;
 6. SQLite `quick_check` and exact v1 schema/metadata identity pass before authoritative use;
-7. initialization is creation-only/idempotent for locally valid storage, coordinates first-use ownership before inspecting the target path, does not require hard links, and does not repair unknown, damaged, or history-invalid databases;
+7. initialization is creation-only/idempotent for locally valid storage, coordinates first-use ownership before inspecting the target path, uses fixed-length alias-safe coordination keys, recovers only marker-backed schema-less interrupted Sayf creation, does not require hard links, and does not repair or legitimize arbitrary unknown, damaged, or history-invalid databases;
 8. hash-chain verification succeeds for valid local history;
 9. verification fails on malformed rows, noncanonical storage, sequence gaps, broken chain links, and modified event content when stored hashes were not recomputed consistently;
 10. authoritative listing and append refuse locally invalid history;
-11. read-only inspection/verification do not initialize missing or unrelated databases;
+11. read-only inspection/verification do not initialize missing or unrelated databases or create coordination artifacts;
 12. duplicate event IDs are rejected;
-13. the CLI can initialize/validate, append, display, and verify a ledger and handles invalid input without tracebacks;
-14. the trust boundary of the unanchored local hash chain is documented explicitly;
-15. CI executes lint and tests on Python 3.12 under both Ubuntu and Windows.
+13. structural validation remains bounded rather than materializing arbitrary malformed metadata or schema collections;
+14. the CLI can initialize/validate, append, display, and verify a ledger and handles invalid input without tracebacks;
+15. the trust boundary of the unanchored local hash chain is documented explicitly;
+16. CI executes lint and tests on Python 3.12 under both Ubuntu and Windows.
