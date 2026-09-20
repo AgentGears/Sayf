@@ -137,7 +137,12 @@ class CausalGraph:
 
     @property
     def records(self) -> tuple[Record, ...]:
-        return tuple(sorted(self._records.values(), key=lambda item: (item.created_sequence, item.id)))
+        return tuple(
+            sorted(
+                self._records.values(),
+                key=lambda item: (item.created_sequence, item.id),
+            )
+        )
 
     @property
     def relations(self) -> tuple[Relation, ...]:
@@ -237,7 +242,7 @@ class CausalGraph:
         found: list[GraphPath] = []
         expansions = 0
 
-        while queue and len(found) < max_paths:
+        while queue:
             current_id, steps, visited = queue.popleft()
             if len(steps) >= max_depth:
                 continue
@@ -266,8 +271,10 @@ class CausalGraph:
                     found.append(
                         GraphPath(start_id=start_id, end_id=end_id, steps=next_steps)
                     )
-                    if len(found) >= max_paths:
-                        break
+                    if len(found) > max_paths:
+                        raise GraphProjectionError(
+                            "provenance path search exceeded the configured result bound"
+                        )
                     continue
                 queue.append((next_id, next_steps, visited | {next_id}))
 
