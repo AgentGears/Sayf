@@ -67,8 +67,8 @@ class CausalRepository:
         self,
     ) -> tuple[CausalGraph, EffectiveStateProjection, int, str | None]:
         events = self.event_store.events()
-        graph = CausalGraph.from_events(events)
-        state = EffectiveStateProjection.from_events(events, graph=graph)
+        state = EffectiveStateProjection.from_events(events)
+        graph = state.graph
         head_hash = events[-1].event_hash if events else None
         return graph, state, len(events), head_hash
 
