@@ -44,10 +44,10 @@ M0 establishes the substrate beneath the control plane:
 - **M0.1 Immutable Ledger** — append-only events, actors, local consistency verification, SQLite persistence, replay/verification.
 - **M0.2 Typed Records + Graph** — immutable typed records/relations derived from ledger history, content-addressed artifacts, deterministic traversal and relationship paths.
 - **M0.3 Revision + Staleness** — explicit relation qualification, invalidation, linear supersession, and deterministic dependency staleness.
-- **M0.4 Evidence + Gates** — verification receipts, policy snapshots, gate decisions.
+- **M0.4 Evidence + Gates** — bounded verification receipts, immutable policy snapshots, exact gate requests, deterministic gate decisions, and decision staleness.
 - **M0.5 Feedback + Explainability** — runtime observations, feedback cases, `why`, `impact`, and `timeline`.
 
-The current codebase implements **M0.1, M0.2, and M0.3**. Evidence sufficiency, gate authority, release authority, and runtime feedback remain deliberately deferred.
+The current codebase implements **M0.1 through M0.4**. Release authority, risk-assessment contracts, runtime feedback, and full explanation queries remain deliberately deferred.
 
 ## Quick start
 
@@ -91,6 +91,31 @@ sayf state invalidate rel_observation_invalidates_assumption
 sayf state show rec_intent
 sayf state affected rec_assumption
 
+sayf record create \
+  --type ChangeSet \
+  --id change_1 \
+  --payload '{"summary":"integration change"}'
+
+sayf record create \
+  --type Evidence \
+  --id evidence_tests \
+  --payload '{"kind":"test-run"}'
+
+sayf verification record \
+  --id verification_tests \
+  --payload '{"subject_id":"change_1","contract":"tests","result":"pass","evidence_record_ids":["evidence_tests"],"environment":{"platform":"local"},"independent_from_generation":"not_applicable","verified_claim":"tests passed for the bound change"}'
+
+sayf policy register \
+  --id policy_1 \
+  --payload '{"name":"test-gate","requirements":[{"contract":"tests","minimum_passes":1}]}'
+
+sayf gate request \
+  --id gate_request_1 \
+  --payload '{"subject_id":"change_1","policy_snapshot_id":"policy_1","verification_receipt_ids":["verification_tests"]}'
+
+sayf gate evaluate gate_request_1 --id gate_decision_1
+sayf gate show gate_decision_1
+
 printf 'verification receipt\n' > receipt.txt
 sayf artifact put receipt.txt \
   --id rec_receipt \
@@ -128,7 +153,7 @@ Graph neighbor queries support outbound, inbound, and combined traversal. Relati
 
 Artifacts use SHA-256 content-addressed storage under `.sayf/objects/sha256/...`. Object bytes are verified against the digest, and an existing or concurrently appearing corrupt object at the expected address is rejected rather than silently overwritten. POSIX publication uses a no-replace hard-link installation of the already-fsynced staging inode and therefore fails closed on a filesystem that cannot provide the required hard-link primitive; Windows uses a write-through no-replace move. This CAS publication requirement is separate from M0.1 ledger initialization, which remains hard-link-independent. An object becomes referenced Sayf engineering state only when an immutable `Artifact` record binds its digest, byte length, metadata, actor, and creating event into the ledger. Unreferenced CAS bytes are not authoritative records.
 
-Except for the typed `Artifact` descriptor, active M0.2 record payloads are canonical JSON objects. Names whose semantics would imply verification, policy/gate authority, release status, or runtime feedback are enumerated for the planned M0 vocabulary but are mechanically reserved until their later milestone contracts exist: `VerificationReceipt`, `RiskAssessment`, `PolicySnapshot`, `GateRequest`, `GateDecision`, `Release`, `RuntimeObservation`, and `FeedbackCase`. This prevents an immutable generic JSON object from acquiring apparent authority merely because it was given a future authoritative type name.
+Except for typed contracts implemented by later milestones, active record payloads are canonical JSON objects. M0.4 activates `VerificationReceipt`, `PolicySnapshot`, `GateRequest`, and `GateDecision` only through their dedicated semantic APIs; they cannot be created through the generic record surface. `RiskAssessment`, `Release`, `RuntimeObservation`, and `FeedbackCase` remain mechanically reserved until their contracts exist. This preserves the rule that a future authoritative-looking type name does not acquire authority merely because generic JSON was stored under that name.
 
 M0.2 relationship claims remain distinct from M0.3 state authority. In particular, `depends_on`, `invalidates`, and `supersedes` relations have no state consequence until an explicit M0.3 qualification event adopts that exact relation.
 
@@ -162,7 +187,7 @@ Invalidated and superseded records are staleness roots. Their qualified transiti
 
 State transitions validate a complete semantic snapshot and use the M0.2 compare-and-append boundary, so any concurrent ledger change between validation and append forces revalidation. Malformed privileged M0.3 state history blocks subsequent semantic operations fail-closed.
 
-The M0.3 actor field is provenance, not an authorization system. In the local-first milestone, permission to invoke a state-transition API comes from the host/application boundary. An agent-authored relation does not become effective merely because it exists; a caller with transition authority must explicitly qualify it. Policy-bound authorization remains an M0.4+ concern.
+The M0.3 actor field is provenance, not an authorization system. In the local-first milestone, permission to invoke a state-transition API comes from the host/application boundary. An agent-authored relation does not become effective merely because it exists; a caller with transition authority must explicitly qualify it. M0.4 adds deterministic policy/evidence sufficiency but does not turn actor IDs into authenticated credentials.
 
 Effective-state projection is correctness-first and currently recomputes from fully verified history. Staleness derivation may revisit the qualified dependency graph once per invalidated/superseded root, so this is not yet a high-throughput design. Persistent projections or incremental invalidation indexes should be introduced only after measurement establishes a forcing function and only if they remain verifiable, disposable acceleration state.
 
@@ -170,19 +195,59 @@ Effective-state projection is correctness-first and currently recomputes from fu
 
 See [`docs/architecture/M0_3_REVISION_STALENESS.md`](docs/architecture/M0_3_REVISION_STALENESS.md) for the M0.3 contract, qualification boundary, and acceptance slice.
 
+## M0.4 — Evidence + Gates
+
+M0.4 activates four previously reserved semantic record contracts through dedicated APIs: `VerificationReceipt`, `PolicySnapshot`, `GateRequest`, and `GateDecision`. Cross-record semantic references bind both immutable record ID and exact content hash, and a binding must point to a record that already existed when the binding record was created. Malformed, mismatched, or forward M0.4 bindings fail semantic replay closed.
+
+A verification receipt records a bounded result for an exact subject using exact evidence records. Results are `pass`, `fail`, `partial`, or `inconclusive`. A pass requires a bounded `verified_claim`; fail and inconclusive receipts cannot assert one. Receipt existence is evidence, not gate authority, and partial/inconclusive results do not satisfy a v1 policy requirement.
+
+A policy snapshot intentionally contains only deterministic verification requirements: a contract name and `minimum_passes >= 1`. M0.4 does not introduce a general-purpose policy language. `minimum_passes` counts distinct bound receipt records that are usable and pass the same contract; it does **not** prove verifier independence, statistical independence, or diversity of underlying evidence unless a future policy contract explicitly models those properties.
+
+A gate request immutably binds one exact `ChangeSet`, one exact policy snapshot, and a fixed receipt set. Every receipt must verify that exact ChangeSet. Requests may intentionally contain insufficient, failed, partial, inconclusive, stale, invalidated, or superseded inputs so failed gate attempts can be preserved as deterministic BLOCK decisions rather than disappearing before evaluation.
+
+Gate evaluation considers the request, ChangeSet, policy, receipts, and bound evidence. A bound input is usable only when its M0.3 effective state is `not_invalidated/current/fresh`; only usable passing receipts count toward policy requirements. Unknown or missing evidence never becomes pass. The decision is `permit` only when there are no blocking reasons and every requirement is satisfied; otherwise it is `block`.
+
+Every persisted gate decision is independently recomputed during replay from the ledger prefix immediately before that decision. A privileged caller cannot make a forged permit authoritative merely by appending a syntactically valid `GateDecision`; if the stored payload differs from the deterministic historical evaluation, semantic replay fails closed. One immutable request may have at most one M0.4 decision; evaluation against a changed input set requires a new request.
+
+A decision also binds the complete canonical M0.3 effective-state fingerprint for every evaluated input, not only the three coarse labels. A later invalidation cause, supersession, dependency-derived staleness path, or other change to that exact effective state makes the historical decision currently stale. The decision record's own M0.3 state must also remain usable. Unrelated ledger events that do not change a bound effective state do not stale the decision.
+
+Gate freshness is independent from gate outcome. A BLOCK decision can remain fresh when it still describes the same unchanged negative input state. Likewise, a historical PERMIT remains historically what was decided even after its current status becomes stale. `PERMIT` means only that the exact request satisfied the exact policy under the exact evaluated state; it does **not** mean released, globally approved, safe, correct, or complete. Release authority remains deferred.
+
+M0.4 retains the exact semantic-head compare-and-append boundary for receipt, policy, request, and decision creation. A concurrent ledger commit after validation forces revalidation rather than allowing a decision to commit against a stale semantic snapshot.
+
+Historical gate verification is correctness-first: replay can reconstruct an M0.3 prefix for each historical gate decision, so worst-case work can approach O(D × N) for D decisions over N events in addition to normal history verification/projection. No mutable gate cache or second authority store is introduced without a measured forcing function.
+
+The dedicated CLI surface is:
+
+```text
+sayf verification record --payload <json>
+sayf policy register --payload <json>
+sayf gate request --payload <json>
+sayf gate evaluate <request_id>
+sayf gate show <decision_id>
+sayf gate list
+```
+
+The actor field on M0.4 records remains provenance, not authenticated identity. The local host/application boundary controls who can invoke these semantic APIs; M0.4 does not invent signatures or remote RBAC.
+
+See [`docs/architecture/M0_4_EVIDENCE_GATES.md`](docs/architecture/M0_4_EVIDENCE_GATES.md) for the M0.4 contract, claim ceilings, replay rules, and acceptance slice.
+
 ## Design invariants
 
 1. **No silent mutation** — accepted historical state is superseded, never rewritten.
 2. **No missing provenance** — durable state identifies the actor and event that created it.
-3. **No unsupported authority** — an agent assertion or relation label is not authoritative merely because it was emitted.
-4. **No stale reuse** — typed/state writes bind the exact ledger head whose semantics they validated.
-5. **No hidden downstream impact** — invalidated or superseded premises expose qualified stale dependents and canonical dependency paths.
-6. **Unknown is not pass** — absence of invalidation, supersession, or staleness is not promoted into truth, acceptance, verification, or pass.
+3. **No unsupported authority** — an agent assertion, relation label, receipt, or type name is not authoritative merely because it was emitted.
+4. **No stale reuse** — typed/state/gate writes bind the exact ledger head whose semantics they validated.
+5. **No hidden downstream impact** — invalidated or superseded premises expose qualified stale dependents and gate decisions bind exact effective-state fingerprints.
+6. **Unknown is not pass** — absence of invalidation, supersession, staleness, or evidence is not promoted into truth, acceptance, verification, or pass.
 7. **Unknown storage is fail-closed** — existing authority stores are validated before authoritative read or mutation.
 8. **Derived semantic state is disposable** — authoritative history remains in immutable ledger events.
 9. **Bounded queries are explicit** — relationship-path limits fail rather than silently presenting partial results as complete.
 10. **CAS publication is no-clobber** — an existing or racing digest address is verified/reused or rejected, never overwritten by normal publication.
 11. **Relation claim is not adoption** — M0.3 state consequences require explicit qualification of an exact immutable relation.
+12. **Evidence is not gate authority** — M0.4 gate outcomes require an exact immutable request and policy, not merely the presence of verification records.
+13. **Gate permit is not release authority** — M0.4 deliberately stops before release registration or approval.
+14. **Historical decisions remain challengeable** — later changes to bound effective-state fingerprints stale prior gate decisions without rewriting them.
 
 ## Development
 
@@ -194,7 +259,7 @@ pytest
 
 CI executes the suite on Python 3.12 under both Ubuntu and Windows.
 
-See [`docs/architecture/VISION.md`](docs/architecture/VISION.md), [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md), [`docs/architecture/M0_CAUSAL_LEDGER.md`](docs/architecture/M0_CAUSAL_LEDGER.md), [`docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md`](docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md), and [`docs/architecture/M0_3_REVISION_STALENESS.md`](docs/architecture/M0_3_REVISION_STALENESS.md).
+See [`docs/architecture/VISION.md`](docs/architecture/VISION.md), [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md), [`docs/architecture/M0_CAUSAL_LEDGER.md`](docs/architecture/M0_CAUSAL_LEDGER.md), [`docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md`](docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md), [`docs/architecture/M0_3_REVISION_STALENESS.md`](docs/architecture/M0_3_REVISION_STALENESS.md), and [`docs/architecture/M0_4_EVIDENCE_GATES.md`](docs/architecture/M0_4_EVIDENCE_GATES.md).
 
 ## License
 
