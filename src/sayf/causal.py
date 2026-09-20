@@ -20,6 +20,7 @@ from sayf.records import (
     relation_event_payload,
     relation_from_event,
 )
+from sayf.semantic_append import append_if_ledger_head
 from sayf.storage import LedgerReadError, SQLiteEventStore
 
 
@@ -55,16 +56,20 @@ class CausalRepository:
             artifact_store=ContentAddressedArtifactStore(artifact_root),
         )
 
+    def _graph_snapshot(self) -> tuple[CausalGraph, int, str | None]:
+        events = self.event_store.events()
+        graph = CausalGraph.from_events(events)
+        head_hash = events[-1].event_hash if events else None
+        return graph, len(events), head_hash
+
     def graph(self) -> CausalGraph:
-        return CausalGraph.from_events(self.event_store.events())
+        graph, _, _ = self._graph_snapshot()
+        return graph
 
     def create_record(self, draft: RecordDraft, *, actor: Actor) -> Record:
         snapshot = RecordDraft.model_validate(draft.model_dump(mode="python"))
         self.event_store.initialize()
-        # Validate existing semantic history before extending it. Record identity is the
-        # creation-event ID, so the ledger's event_id UNIQUE constraint is also the
-        # cross-process uniqueness guard for record creation.
-        graph = self.graph()
+        graph, expected_event_count, expected_head_hash = self._graph_snapshot()
         try:
             graph.record(snapshot.record_id)
         except GraphProjectionError:
@@ -72,21 +77,24 @@ class CausalRepository:
         else:
             raise LedgerReadError(f"record id already exists: {snapshot.record_id}")
 
-        event = self.event_store.append(
+        event = append_if_ledger_head(
+            self.event_store,
             EventDraft(
                 event_id=snapshot.record_id,
                 stream_id=f"record:{snapshot.record_id}",
                 event_type=RECORD_CREATED_EVENT_TYPE,
                 actor=actor,
                 payload=record_event_payload(snapshot),
-            )
+            ),
+            expected_event_count=expected_event_count,
+            expected_head_hash=expected_head_hash,
         )
         return record_from_event(event)
 
     def create_relation(self, draft: RelationDraft, *, actor: Actor) -> Relation:
         snapshot = RelationDraft.model_validate(draft.model_dump(mode="python"))
         self.event_store.initialize()
-        graph = self.graph()
+        graph, expected_event_count, expected_head_hash = self._graph_snapshot()
         graph.record(snapshot.source_id)
         graph.record(snapshot.target_id)
         try:
@@ -96,14 +104,17 @@ class CausalRepository:
         else:
             raise LedgerReadError(f"relation id already exists: {snapshot.relation_id}")
 
-        event = self.event_store.append(
+        event = append_if_ledger_head(
+            self.event_store,
             EventDraft(
                 event_id=snapshot.relation_id,
                 stream_id=f"relation:{snapshot.relation_id}",
                 event_type=RELATION_CREATED_EVENT_TYPE,
                 actor=actor,
                 payload=relation_event_payload(snapshot),
-            )
+            ),
+            expected_event_count=expected_event_count,
+            expected_head_hash=expected_head_hash,
         )
         return relation_from_event(event)
 
