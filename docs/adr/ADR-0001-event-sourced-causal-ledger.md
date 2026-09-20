@@ -24,12 +24,13 @@ For the initial implementation:
 - first-use ownership is serialized **before the target ledger path is inspected** by an exclusive lock in a tiny non-authoritative SQLite coordination sidecar;
 - coordination filenames use a fixed-length SHA-256 key of the normalized, case-folded resolved target path so lexical/case aliases share the same initialization barrier conservatively;
 - recovery markers use a separate, stricter fixed-length target identity based on the resolved path with only operating-system-native path normalization, preventing a conservative coordination collision from authorizing recovery of a distinct case-sensitive target;
-- before reserving a missing target, the lock owner writes the recovery token to a same-directory staging file, flushes and fsyncs it, and atomically publishes the target-specific pending-initialization marker; target reservation occurs only after that publication succeeds;
-- after acquiring the barrier and publishing the marker, the owner reserves the target path with exclusive file creation and creates the v1 schema inside a single SQLite transaction;
+- before reserving a missing target, the lock owner writes the recovery token to a same-directory staging file, flushes and fsyncs it, atomically publishes the target-specific pending-initialization marker, and on POSIX fsyncs the containing directory before target reservation; target reservation occurs only after that durability step succeeds;
+- after acquiring the barrier and durably publishing the marker, the owner reserves the target path with exclusive file creation and creates the v1 schema inside a single SQLite transaction;
 - an interrupted initialization is recoverable only when the target-specific marker exists and the target remains schema-less SQLite storage; arbitrary existing or user-schema-bearing databases remain fail-closed;
 - a stale pending marker beside an already valid Sayf ledger is cleared after the ledger passes normal validation;
 - a global unkeyed SHA-256 hash chain provides an internal chain-consistency check;
 - verification checks contiguous `1..N` sequence state, canonical stored representations, hash linkage, and canonical event hashes;
+- authoritative read operations hold one explicit SQLite read transaction from `quick_check` and exact schema/metadata validation through event-history consumption, so the usability result describes one database snapshot;
 - initialization, authoritative listing, and append fail closed when existing local history is invalid;
 - append passes through the initialization barrier and then re-verifies the existing local ledger under the same immediate write transaction before extending it;
 - read-only inspection and verification never initialize or mutate a missing database;
@@ -37,7 +38,7 @@ For the initial implementation:
 - larger immutable artifacts will use content-addressed filesystem storage in M0.2;
 - human-readable Markdown/JSON files are projections, not authoritative state.
 
-The coordination sidecar and pending marker contain no authoritative Sayf state. The sidecar exists only for cross-process first-use serialization. The marker records only that Sayf had begun creating one specific recovery identity under that barrier so a crash-interrupted schema-less target can be retried safely. A partially written staging file is not a recovery authorization token; only the fully published final marker is recognized.
+The coordination sidecar and pending marker contain no authoritative Sayf state. The sidecar exists only for cross-process first-use serialization. The marker records only that Sayf had begun creating one specific recovery identity under that barrier so a crash-interrupted schema-less target can be retried safely. A partially written staging file is not a recovery authorization token; only the fully published final marker is recognized. On POSIX, the marker rename is not considered durably published until the containing directory has also been fsynced.
 
 ## Trust boundary
 
@@ -45,13 +46,13 @@ The M0.1 local hash chain is **not an authenticity proof** against an adversary 
 
 An actor who can bypass the database guards can modify, remove, insert, or renumber events and recompute the affected hash chain, yielding a self-consistent ledger that local verification cannot distinguish from an originally accepted history. The same trust limitation applies to truncating the current tail.
 
-Therefore M0.1 establishes **local usability and consistency**, not externally anchored historical authenticity. It detects SQLite integrity failures surfaced by `quick_check`, unsupported or altered local schema, malformed records, noncanonical stored representations, sequence gaps, broken links, and content rewrites whose affected hashes were not recomputed consistently. It cannot prove that the current self-consistent ledger is the same ledger previously observed by an external party.
+Therefore M0.1 establishes **local usability and consistency**, not externally anchored historical authenticity. It detects SQLite integrity failures surfaced by `quick_check`, unsupported or altered local schema, malformed records, noncanonical stored representations, sequence gaps, broken links, and content rewrites whose affected hashes were not recomputed consistently. A successful read-side result describes one transactionally consistent SQLite snapshot. It cannot prove that the current self-consistent ledger is the same ledger previously observed by an external party.
 
 Authenticity after local-store compromise requires an externally anchored mechanism such as a signed checkpoint, independently stored chain head, replicated witness, transparency log, or equivalent trust anchor. That capability is deliberately deferred beyond M0.1.
 
 ## Why SQLite
 
-SQLite provides transactional local persistence, deterministic ordering, recursive query capability for later graph projections, broad portability, and a very small operational surface. It also provides the cross-process locking primitive used by first-use coordination, avoiding another runtime dependency.
+SQLite provides transactional local persistence, deterministic ordering, recursive query capability for later graph projections, broad portability, and a very small operational surface. It also provides the cross-process locking primitive used by first-use coordination and snapshot isolation for read-side validation, avoiding another runtime dependency.
 
 A graph database, distributed log, ORM, or event-streaming platform would add infrastructure before Sayf has proven its causal semantics.
 
@@ -61,14 +62,15 @@ A graph database, distributed log, ORM, or event-streaming platform would add in
 
 - complete locally valid history can be replayed;
 - authoritative reads and writes fail closed on a locally invalid ledger;
+- authoritative read validation and history consumption describe one SQLite snapshot rather than a mix of concurrently committed states;
 - malformed rows, noncanonical storage, sequence gaps, unrecomputed content changes, and chain discontinuities are detected before authoritative use;
 - unknown or damaged databases are not silently repaired or converted;
 - first-use initialization does not depend on filesystem hard-link capability;
 - concurrent first-use ownership is decided before any contender classifies the target path;
 - case-insensitive path aliases conservatively share one first-use barrier;
 - conservative lock-key collisions cannot cross-authorize recovery of distinct case-sensitive targets;
-- the recovery token is fully published before target reservation, so a failed or interrupted staging write cannot create a partial final marker that legitimizes later recovery;
-- a process/host interruption after marker publication during first-use initialization can be retried when Sayf's target-specific pending marker proves the schema-less target came from an interrupted Sayf creation attempt;
+- the recovery token is fully published before target reservation, and on POSIX its directory entry is fsynced before a recoverable target may appear;
+- a process/host interruption after durable marker publication during first-use initialization can be retried when Sayf's target-specific pending marker proves the schema-less target came from an interrupted Sayf creation attempt;
 - schema lookalikes such as `sqlitex` cannot evade exact-schema or interrupted-recovery validation by matching a wildcard approximation of `sqlite_`;
 - supersession and invalidation can later be expressed without rewriting old semantic state;
 - adapters do not need an LLM to inspect authoritative history;
@@ -80,6 +82,7 @@ A graph database, distributed log, ORM, or event-streaming platform would add in
 - schema evolution must be explicit and versioned;
 - projections must be rebuildable and version-aware;
 - a small non-authoritative SQLite coordination sidecar and, transiently, a pending marker accompany first-use initialization;
+- durable POSIX marker publication adds a parent-directory fsync before target reservation;
 - conservative case folding can serialize distinct case-sensitive paths that differ only by case, reducing initialization concurrency but not correctness;
 - on a case-insensitive POSIX filesystem, recovery through a differently cased spelling may fail closed because recovery identity is intentionally stricter than lock identity;
 - M0.1 append re-verifies the full existing event history, making each append O(N) in ledger length and a sequence of N appends O(N²) overall;
@@ -127,7 +130,11 @@ Rejected because conservative case folding is useful for serialization on case-i
 
 ### Direct in-place creation of the pending marker
 
-Rejected because an interruption during a direct write can leave a truncated or malformed final marker that wedges retry. The recovery token is staged in the same directory, flushed and fsynced, and then atomically renamed into its final path before the target ledger is reserved.
+Rejected because an interruption during a direct write can leave a truncated or malformed final marker that wedges retry. The recovery token is staged in the same directory, flushed and fsynced, atomically renamed into its final path, and on POSIX the containing directory is fsynced before the target ledger is reserved.
+
+### Autocommit read validation followed by a separate history scan
+
+Rejected because a concurrent direct writer can commit between schema validation and event consumption, causing one authoritative operation to mix states from different SQLite snapshots. Read-side validation and history consumption therefore remain inside one explicit read transaction.
 
 ### Treating all empty SQLite files as interrupted initialization
 
