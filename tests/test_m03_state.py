@@ -161,8 +161,8 @@ def test_state_activation_requires_matching_relation_type(tmp_path: Path) -> Non
 
 def test_supersession_requires_same_record_type(tmp_path: Path) -> None:
     repo = repository(tmp_path)
-    create_record(repo, "new", RecordType.INTENT_REVISION)
     create_record(repo, "old", RecordType.ASSUMPTION)
+    create_record(repo, "new", RecordType.INTENT_REVISION)
     create_relation(repo, "sup", RelationType.SUPERSEDES, "new", "old")
 
     with pytest.raises(StateProjectionError, match="same type"):
@@ -173,18 +173,18 @@ def test_supersession_lineage_rejects_branching_and_noncurrent_source(
     tmp_path: Path,
 ) -> None:
     repo = repository(tmp_path)
-    for record_id in ("i1", "i2", "i3", "i4"):
+    for record_id in ("i0", "i1", "i2", "i3"):
         create_record(repo, record_id, RecordType.INTENT_REVISION)
 
     create_relation(repo, "sup_i2_i1", RelationType.SUPERSEDES, "i2", "i1")
     create_relation(repo, "sup_i3_i1", RelationType.SUPERSEDES, "i3", "i1")
-    create_relation(repo, "sup_i1_i4", RelationType.SUPERSEDES, "i1", "i4")
+    create_relation(repo, "sup_i1_i0", RelationType.SUPERSEDES, "i1", "i0")
     repo.supersede("sup_i2_i1", actor=ACTOR)
 
     with pytest.raises(StateProjectionError, match="already superseded through relation"):
         repo.supersede("sup_i3_i1", actor=ACTOR)
     with pytest.raises(StateProjectionError, match="was already superseded"):
-        repo.supersede("sup_i1_i4", actor=ACTOR)
+        repo.supersede("sup_i1_i0", actor=ACTOR)
 
 
 def test_duplicate_state_activation_is_rejected(tmp_path: Path) -> None:
