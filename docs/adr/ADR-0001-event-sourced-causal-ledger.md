@@ -20,15 +20,18 @@ For the initial implementation:
 - a versioned exact schema identifies a supported Sayf v1 ledger;
 - SQLite `quick_check` validates the local database container before authoritative use;
 - database triggers reject event updates, deletes, and replacement-insert collisions during normal access;
-- first-use schema creation executes inside a single SQLite `BEGIN EXCLUSIVE` transaction, so concurrent initializers serialize through SQLite rather than relying on filesystem hard-link support;
+- first-use ownership is serialized **before the target ledger path is inspected** by an exclusive lock in a tiny non-authoritative SQLite coordination sidecar;
+- after acquiring that barrier, the owner reserves the target path with exclusive file creation and creates the v1 schema inside a single SQLite transaction;
 - a global unkeyed SHA-256 hash chain provides an internal chain-consistency check;
 - verification checks contiguous `1..N` sequence state, canonical stored representations, hash linkage, and canonical event hashes;
 - initialization, authoritative listing, and append fail closed when existing local history is invalid;
-- append re-verifies the existing local ledger under the same immediate write transaction before extending it;
+- append passes through the initialization barrier and then re-verifies the existing local ledger under the same immediate write transaction before extending it;
 - read-only inspection and verification never initialize or mutate a missing database;
 - current state is derived from events rather than stored as mutable semantic truth;
 - larger immutable artifacts will use content-addressed filesystem storage in M0.2;
 - human-readable Markdown/JSON files are projections, not authoritative state.
+
+The coordination sidecar contains no authoritative Sayf state. Its sole purpose is cross-process first-use ownership, and SQLite releases its lock when a process or connection terminates.
 
 ## Trust boundary
 
@@ -42,7 +45,7 @@ Authenticity after local-store compromise requires an externally anchored mechan
 
 ## Why SQLite
 
-SQLite provides transactional local persistence, deterministic ordering, recursive query capability for later graph projections, broad portability, and a very small operational surface.
+SQLite provides transactional local persistence, deterministic ordering, recursive query capability for later graph projections, broad portability, and a very small operational surface. It also provides the cross-process locking primitive used by first-use coordination, avoiding another runtime dependency.
 
 A graph database, distributed log, ORM, or event-streaming platform would add infrastructure before Sayf has proven its causal semantics.
 
@@ -55,6 +58,7 @@ A graph database, distributed log, ORM, or event-streaming platform would add in
 - malformed rows, noncanonical storage, sequence gaps, unrecomputed content changes, and chain discontinuities are detected before authoritative use;
 - unknown or damaged databases are not silently repaired or converted;
 - first-use initialization does not depend on filesystem hard-link capability;
+- concurrent first-use ownership is decided before any contender classifies the target path;
 - supersession and invalidation can later be expressed without rewriting old semantic state;
 - adapters do not need an LLM to inspect authoritative history;
 - later projections can be rebuilt from source events;
@@ -64,6 +68,7 @@ A graph database, distributed log, ORM, or event-streaming platform would add in
 
 - schema evolution must be explicit and versioned;
 - projections must be rebuildable and version-aware;
+- a small non-authoritative SQLite coordination sidecar accompanies the ledger for initialization locking;
 - M0.1 append re-verifies the full existing event history, making each append O(N) in ledger length and a sequence of N appends O(N²) overall;
 - SQLite integrity checking adds additional local I/O before authoritative use;
 - distributed multi-writer operation is deferred;
@@ -97,7 +102,11 @@ Rejected for M0.1 because schema-valid storage can still contain locally invalid
 
 ### Filesystem hard-link installation
 
-Rejected because it makes otherwise-valid SQLite deployments depend on a filesystem capability that is not universally available. First-use concurrency is instead serialized by SQLite's own write-locking transaction semantics.
+Rejected because it makes otherwise-valid SQLite deployments depend on a filesystem capability that is not universally available.
+
+### Target-ledger locking without pre-creation ownership
+
+Rejected because SQLite creates an `rwc` target before the first target transaction can acquire its lock, leaving a race where a contender can mistake an in-progress target for pre-existing unknown storage. The coordination lock must therefore be acquired independently before the target path is inspected.
 
 ### External checkpointing in M0.1
 
