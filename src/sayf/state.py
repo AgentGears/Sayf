@@ -153,14 +153,9 @@ class EffectiveStateProjection:
         self._states = self._derive_states()
 
     @classmethod
-    def from_events(
-        cls,
-        events: Iterable[LedgerEvent],
-        *,
-        graph: CausalGraph | None = None,
-    ) -> EffectiveStateProjection:
+    def from_events(cls, events: Iterable[LedgerEvent]) -> EffectiveStateProjection:
         event_list = tuple(events)
-        graph = CausalGraph.from_events(event_list) if graph is None else graph
+        graph = CausalGraph.from_events(event_list)
 
         bound_dependencies: list[_Activation] = []
         invalidations: list[_Activation] = []
@@ -391,6 +386,10 @@ class EffectiveStateProjection:
                 stale_causes=stale_causes,
             )
         return states
+
+    @property
+    def graph(self) -> CausalGraph:
+        return self._graph
 
     @property
     def states(self) -> tuple[RecordEffectiveState, ...]:
