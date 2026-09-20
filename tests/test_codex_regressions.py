@@ -1,0 +1,158 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from types import SimpleNamespace
+
+import pytest
+import typer
+from typer.testing import CliRunner
+
+from sayf import cli as cli_module
+from sayf.cli import _parse_payload, app
+from sayf.storage import LedgerReadError, SQLiteEventStore
+
+runner = CliRunner()
+
+
+def _force_json_recursion(monkeypatch) -> None:
+    def recursive_loads(*args, **kwargs):
+        raise RecursionError("forced JSON decoder recursion")
+
+    monkeypatch.setattr(
+        cli_module,
+        "json",
+        SimpleNamespace(loads=recursive_loads, JSONDecodeError=json.JSONDecodeError),
+    )
+
+
+@pytest.mark.parametrize("sequence", [0, -1])
+def test_verify_nonpositive_sequence_fails_closed(tmp_path, sequence: int) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    store.initialize()
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            INSERT INTO events (
+                sequence, event_id, stream_id, event_type, occurred_at,
+                actor_json, payload_json, previous_event_hash, event_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                sequence,
+                f"evt_invalid_{sequence}",
+                "project:test",
+                "RecordCreated",
+                "2026-09-20T00:00:00+00:00",
+                '{"display_name":null,"id":"tester","kind":"human","metadata":{}}',
+                "{}",
+                None,
+                f"sha256:invalid-{sequence}",
+            ),
+        )
+        connection.commit()
+
+    result = store.verify()
+
+    assert result.valid is False
+    assert result.checked_events == 0
+    assert result.failure_sequence == sequence
+    assert result.reason is not None
+    assert result.reason.startswith("malformed event row:")
+
+
+def test_parse_payload_converts_recursion_to_bad_parameter(monkeypatch) -> None:
+    _force_json_recursion(monkeypatch)
+
+    with pytest.raises(typer.BadParameter, match="payload is not valid strict JSON"):
+        _parse_payload("{}")
+
+
+def test_cli_converts_json_recursion_without_traceback(tmp_path, monkeypatch) -> None:
+    db = tmp_path / "ledger.sqlite3"
+    _force_json_recursion(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "ledger",
+            "append",
+            "--type",
+            "RecordCreated",
+            "--payload",
+            "{}",
+            "--db",
+            str(db),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Traceback" not in result.output
+    assert db.exists() is False
+
+
+def test_metadata_validation_does_not_materialize_all_rows(tmp_path) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    store.initialize()
+
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            "INSERT INTO sayf_ledger_meta (key, value) VALUES ('extra', 'unexpected')"
+        )
+        connection.commit()
+
+        class MetadataCursorProxy:
+            def __init__(self, cursor: sqlite3.Cursor) -> None:
+                self.cursor = cursor
+
+            def fetchone(self):
+                return self.cursor.fetchone()
+
+            def fetchall(self):
+                raise AssertionError("metadata validation must not materialize all rows")
+
+        class ConnectionProxy:
+            def __init__(self, wrapped: sqlite3.Connection) -> None:
+                self.wrapped = wrapped
+
+            def execute(self, sql: str, parameters=()):
+                cursor = self.wrapped.execute(sql, parameters)
+                if "FROM sayf_ledger_meta ORDER BY key" in sql:
+                    return MetadataCursorProxy(cursor)
+                return cursor
+
+        with pytest.raises(
+            LedgerReadError,
+            match="Sayf ledger metadata is unsupported or malformed",
+        ):
+            SQLiteEventStore._validate_schema(ConnectionProxy(connection))
+
+
+def test_read_connection_holds_one_snapshot_across_validation(tmp_path) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    store.initialize()
+
+    with sqlite3.connect(path) as setup:
+        journal_mode = setup.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+    assert str(journal_mode).lower() == "wal"
+
+    with store._read_connection() as reader:
+        with sqlite3.connect(path) as writer:
+            writer.execute(
+                "UPDATE sayf_ledger_meta SET value = '999' WHERE key = 'schema_version'"
+            )
+            writer.commit()
+
+        visible_version = reader.execute(
+            "SELECT value FROM sayf_ledger_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        assert visible_version == "1"
+
+    result = store.verify()
+    assert result.valid is False
+    assert result.reason == "Sayf ledger schema version is unsupported"

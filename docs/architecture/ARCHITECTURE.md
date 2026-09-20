@@ -1,0 +1,176 @@
+# Sayf Architecture Baseline
+
+## 1. Layer model
+
+Sayf separates four layers:
+
+```text
+Human / Agent / Tool Layer
+          |
+          v
+Adapter / Workflow Layer
+          |
+          v
+Control Plane
+  intent | evidence | policy | gates | feedback
+          |
+          v
+Causal Ledger
+  events | records | relations | artifacts | projections
+```
+
+The Causal Ledger is the lowest authoritative layer. Higher layers may evolve without rewriting historical ledger state.
+
+## 2. Authority boundary
+
+An LLM, workflow, reviewer, CI job, or runtime adapter may produce an observation, proposal, or evidence artifact. It does not gain authority merely by producing text.
+
+Future authoritative decisions must bind exact immutable inputs, including the accepted intent revision, baseline snapshot, policy snapshot, change set, evidence, and risk assessment.
+
+## 3. Causal Ledger
+
+M0 uses an append-only event ledger as the source of truth.
+
+Each event includes:
+
+- globally ordered sequence;
+- stable event ID;
+- logical stream ID;
+- event type;
+- UTC occurrence time;
+- actor;
+- structured JSON-native payload;
+- previous event hash;
+- event hash.
+
+The hash chain is global rather than per stream. Verification checks canonical stored JSON/timestamps, contiguous sequence state, each event hash, and each chain link against the currently stored event history. It therefore detects malformed or noncanonical rows, sequence gaps, broken links, and rewrites whose affected hashes were not recomputed consistently.
+
+The M0.1 hash chain is **not** an authenticity proof against an actor with arbitrary database write access. Such an actor can rewrite or renumber history and recompute the affected chain, or truncate the current tail, while leaving a locally self-consistent ledger. External checkpointing, signing, or witnessing is required to detect that stronger class of attack.
+
+SQLite triggers reject `UPDATE`, `DELETE`, and replacement inserts that collide with an existing event sequence, event ID, or event hash during normal database access. Hash verification is independent of those triggers, but its result remains a statement about local consistency rather than externally anchored authenticity.
+
+## 4. Persistent state strategy
+
+M0 uses:
+
+- SQLite for ordered events and later graph projections;
+- SQLite `quick_check` as a local container-integrity prerequisite;
+- a versioned, exact ledger schema/metadata identity;
+- canonical stored representations for timestamps and structured event data;
+- complete local-history verification before authoritative listing or append;
+- a non-authoritative SQLite coordination sidecar for cross-process first-use ownership;
+- a target-specific non-authoritative pending-initialization marker for crash recovery;
+- a Windows-only non-authoritative revoked-marker tombstone used solely to make marker revocation a durable name transition;
+- filesystem content-addressed storage for larger immutable artifacts (M0.2+);
+- generated Markdown/JSON projections for humans and adapters.
+
+Human-readable projections are never authoritative storage. The initialization sidecar, pending marker, and revoked tombstone are also non-authoritative. The sidecar provides a cross-process SQLite lock before the target ledger path is inspected. The pending marker records only that Sayf had begun creating one specific recovery identity under the barrier. A revoked tombstone records no authorization at all and is never accepted as evidence that a target may be recovered.
+
+Initialization is creation-only and idempotent for an already locally valid ledger. It does not silently repair, migrate, convert, or legitimize an existing unknown, damaged, or history-invalid database. Repair and migration require explicit future operations.
+
+For first use, Sayf first acquires an exclusive transaction on the coordination sidecar. The lock name is a fixed-length hash of the normalized, case-folded resolved target path, conservatively folding aliases that may refer to the same target on case-insensitive filesystems. Recovery authorization uses a separate, stricter fixed-length identity derived from the resolved target using only the operating system's native path normalization. This separation means conservative coordination collisions can serialize distinct case-sensitive targets without allowing one target's pending marker to authorize recovery of the other. Only the lock owner may inspect the target path.
+
+If the target is absent, the owner writes the recovery token to a same-directory staging file, flushes and fsyncs that staging file, and then durably publishes the target-specific pending marker before reserving the target. POSIX publication uses an atomic rename followed by parent-directory fsync. Windows publication uses `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, which does not report success until the move is completed on disk. If a Windows recovery attempt encounters an already-published pending marker, Sayf stages the same marker content and replaces the existing marker with another write-through move before using it as recovery authorization. Only after the platform-specific publication durability step succeeds does Sayf reserve the target with exclusive file creation and create the schema inside one SQLite transaction. If marker publication or its required durability step fails, the target is not reserved.
+
+If the process or host stops after durable marker publication but before commit, the marker survives independently of the target transaction; the next lock owner may recover only a marker-backed target that remains schema-less SQLite storage for that recovery identity. A non-Sayf, non-SQLite, or user-schema-bearing target is still rejected.
+
+Recovery authorization is revoked durably before initialization reports success. On POSIX, Sayf unlinks the `.pending` marker and fsyncs the parent directory. On Windows, Sayf performs a write-through rename from the authoritative `.pending` marker to a target-specific `.revoked` tombstone. After that write-through move succeeds, the authoritative recovery-marker name is durably absent; cleanup of the tombstone is best-effort because `.revoked` is never recognized as recovery authorization. A failed Windows revocation transition leaves the `.pending` marker in place and causes initialization to fail. A committed ledger therefore does not make initialization successful while recovery authorization is still uncertain.
+
+This ordering prevents a contender from classifying another Sayf process's in-progress target as pre-existing storage, avoids stale recovery authorization after successful initialization, and does not require filesystem hard links. Appends pass through the same barrier before the normal `BEGIN IMMEDIATE` append transaction.
+
+Schema inspection excludes only objects whose names begin with SQLite's literal reserved `sqlite_` prefix. Lookalike names such as `sqlitex` are user schema and therefore cause exact-schema validation or interrupted-recovery validation to fail closed.
+
+Authoritative read operations begin an explicit SQLite read transaction before container/schema validation and retain it through event-history consumption. `quick_check`, exact schema/metadata inspection, and canonical history verification therefore describe one database snapshot even if an external writer commits concurrently. The read transaction is released without mutation after the operation completes.
+
+On a case-insensitive POSIX filesystem, an interrupted initialization retried through a differently cased spelling may fail closed because recovery identity is intentionally stricter than coordination identity. This is preferable to cross-authorizing a distinct target on a case-sensitive filesystem.
+
+Appending currently re-verifies the complete existing local history inside the immediate write transaction. That is intentionally O(N) per append in M0.1; optimization is deferred until it can preserve the same fail-closed authority boundary.
+
+## 5. Event sourcing
+
+Semantic state is derived from events. Durable transitions are represented by new events rather than destructive updates.
+
+Examples planned across M0:
+
+```text
+RecordCreated
+RelationCreated
+IntentAccepted
+IntentSuperseded
+BaselineRegistered
+TaskGraphRegistered
+VerificationRecorded
+GateRequested
+GateEvaluated
+ReleaseRegistered
+ObservationRegistered
+FeedbackOpened
+RecordInvalidated
+```
+
+M0.1 implements the generic immutable event substrate before introducing these higher-level domain handlers.
+
+## 6. M0 milestone decomposition
+
+### M0.1 — Immutable Ledger
+
+- actor model;
+- UUIDv7 identifiers;
+- JSON-native/UTF-8 event-value validation;
+- canonical storage and serialization;
+- append-only SQLite storage;
+- SQLite container integrity check;
+- versioned exact schema/metadata identity;
+- pre-creation, cross-process first-use coordination using SQLite locking;
+- crash-recoverable first-use ownership with platform-specific durable marker publication and durable recovery-authorization revocation, without cross-authorizing distinct targets;
+- single-snapshot authoritative read validation and history consumption;
+- local history consistency verification;
+- fail-closed authoritative replay/listing and append;
+- CLI and CI tests on Ubuntu and Windows.
+
+### M0.2 — Typed Records + Graph
+
+- records;
+- typed relations;
+- content-addressed artifacts;
+- adjacency traversal;
+- provenance paths.
+
+### M0.3 — Revision + Staleness
+
+- revision lineage;
+- supersession;
+- effective state;
+- deterministic staleness propagation.
+
+### M0.4 — Evidence + Gates
+
+- verification receipts;
+- policy snapshots;
+- gate requests;
+- deterministic gate decisions;
+- gate invalidation when bound inputs change.
+
+### M0.5 — Feedback + Explainability
+
+- releases;
+- runtime observations;
+- feedback cases;
+- `why`, `impact`, and `timeline` queries.
+
+## 7. Architectural invariants
+
+1. Durable historical records are not silently rewritten.
+2. Every durable transition has an actor and creating event.
+3. Authority is explicit and version-bound.
+4. Stale authority is not silently reusable.
+5. Downstream impact must be explainable by relationship paths.
+6. Unknown is not equivalent to pass.
+7. The ledger must operate without an LLM.
+8. Existing authority stores are validated before authoritative read or mutation; invalid local state is fail-closed.
+
+## 8. Deliberate exclusions
+
+M0 does not require a graph database, ORM, vector database, distributed scheduler, web UI, Kubernetes, or custom coding-agent runtime.
+
+Those are implementation choices above the causal semantics and should not be introduced before the core model demonstrates value.
