@@ -33,9 +33,11 @@ A gate decision is not release authority. `Release` remains deferred to M0.5.
 M0.4 does not promote evidence existence into truth or a gate permit into global approval.
 
 - `VerificationReceipt(result=pass)` means the named verification contract produced a pass result for the exact bound subject using the exact bound evidence, under the recorded environment and limitations.
+- `VerificationReceipt(result=partial)` may preserve a bounded partial verified claim, but it does not satisfy an M0.4 v1 policy requirement.
 - `GateDecision(outcome=permit)` means only that the exact gate request satisfied the exact bound policy under the exact effective-state fingerprints captured at evaluation.
 - `GateDecision(outcome=block)` means the exact request did not satisfy that policy at evaluation. It does not mean the subject is incorrect.
 - `GateDecision(fresh)` means the bound effective-state inputs are unchanged since evaluation. It does not mean they were all usable or positive.
+- `minimum_passes` counts distinct qualifying receipt records. It does not establish verifier independence, evidence independence, statistical independence, or diversity of underlying evidence.
 - No M0.4 state means releasable, safe, correct, complete, or approved outside the bound policy contract.
 
 ## 3. Authority boundary
@@ -52,6 +54,14 @@ The following record types now have implemented contracts and dedicated semantic
 `RiskAssessment`, `Release`, `RuntimeObservation`, and `FeedbackCase` remain reserved.
 
 The actor on an M0.4 record is provenance, not a cryptographically authenticated credential. Local invocation authority still comes from the host/application boundary. M0.4 policy snapshots constrain deterministic evidence sufficiency; they do not pretend that actor IDs are authenticated identities.
+
+### Upgrade trust boundary
+
+M0.4 adoption assumes the input ledger was semantically valid under the immediately preceding milestone before M0.4 semantics are enabled. Under the supported M0.3 API surface, the four M0.4 record types were mechanically reserved and therefore could not appear in a valid M0.3 semantic history.
+
+Sayf does not currently carry an external signed runtime-version witness that can prove which software version created every historical event. A caller that bypassed the supported M0.3 semantic APIs and inserted a future-shaped low-level event was already operating inside the documented local privileged-write boundary. M0.4 does not add a heavyweight storage-schema migration solely to authenticate that historical runtime provenance. If cross-version provenance becomes a trust requirement, it needs an explicit migration/checkpoint contract rather than inference from type names.
+
+This boundary does not permit forward references inside M0.4 records: every M0.4 cross-record binding still has to reference content that already existed earlier in the immutable ledger.
 
 ## 4. Exact record bindings
 
@@ -80,7 +90,7 @@ A `VerificationReceipt` contains:
 - bounded verified claim when applicable;
 - prohibited generalizations.
 
-A `pass` requires a non-empty `verified_claim`. `fail` and `inconclusive` may not assert a verified claim.
+A `pass` requires a non-empty `verified_claim`. `fail` and `inconclusive` may not assert a verified claim. A `partial` receipt may preserve a bounded partial claim but remains non-passing for v1 gate sufficiency.
 
 Receipt creation records evidence; it does not itself grant gate authority. A receipt may remain historically meaningful even when its subject/evidence is already stale or invalidated. Gate evaluation handles current usability separately.
 
@@ -95,7 +105,7 @@ contract
 minimum_passes >= 1
 ```
 
-Contract names must be unique within one policy snapshot.
+Contract names must be unique within one policy snapshot. `minimum_passes` counts distinct usable PASS receipt records for that contract. M0.4 v1 does not infer independence from different receipt IDs, different actors, or different evidence records.
 
 A policy snapshot is immutable. Changing policy means creating a new snapshot and explicitly superseding/invalidating the old snapshot when that old authority should stop being reusable.
 
@@ -109,7 +119,7 @@ A `GateRequest` binds:
 - one exact `PolicySnapshot`;
 - zero or more exact `VerificationReceipt` records.
 
-Every bound receipt must verify the same exact subject binding as the request. A request may contain insufficient, failed, or stale evidence; this is intentional because a deterministic BLOCK decision should be able to preserve the failed gate attempt rather than preventing the attempt from being recorded.
+Every bound receipt must verify the same exact subject binding as the request. A request may contain insufficient, failed, partial, inconclusive, or stale evidence; this is intentional because a deterministic BLOCK decision should be able to preserve the failed gate attempt rather than preventing the attempt from being recorded.
 
 ## 8. Deterministic evaluation
 
@@ -222,6 +232,8 @@ No mutable gate cache or second authority store is introduced in M0.4. A future 
 11. A BLOCK decision may be fresh.
 12. A gate permit is not release authority.
 13. M0.4 semantic writes retain the semantic-head TOCTOU guard.
+14. `minimum_passes` is a receipt-count condition, not an inferred independence guarantee.
+15. Supported M0.4 adoption starts from semantically valid prior-milestone history; historical runtime provenance is not cryptographically attested.
 
 ## 15. Acceptance slice
 
@@ -261,6 +273,7 @@ M0.4 does not implement:
 - gate-request mutation or receipt attachment after creation;
 - multiple decisions for one request;
 - general `why` / `impact` / `timeline` explanation surfaces;
-- persistent materialized gate projections.
+- persistent materialized gate projections;
+- cryptographic attestation of historical runtime/version provenance.
 
 Those require explicit forcing functions or later milestone contracts rather than being inferred into M0.4.
