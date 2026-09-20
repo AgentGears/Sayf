@@ -242,6 +242,33 @@ def test_posix_cas_durably_anchors_new_directory_entries(
     assert target.parent in synced
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX CAS directory durability regression")
+def test_posix_cas_anchors_existing_concurrent_directory_boundary(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "concurrent-root"
+    root.mkdir()
+    store = ContentAddressedArtifactStore(root)
+    synced: list[Path] = []
+
+    def record_sync(path: Path) -> None:
+        synced.append(Path(path))
+
+    monkeypatch.setattr(
+        ContentAddressedArtifactStore,
+        "_fsync_directory",
+        staticmethod(record_sync),
+    )
+
+    store._ensure_directory_durable(root / "sha256" / "ab")
+
+    # Syncing only the existing boundary itself persists future child entries but
+    # does not anchor the boundary's own name. Its parent must be synced as well.
+    assert root in synced
+    assert tmp_path in synced
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX no-clobber CAS publication regression")
 def test_posix_cas_race_never_overwrites_object_that_appears_before_publish(
     tmp_path: Path,
