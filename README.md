@@ -42,14 +42,14 @@ Sayf is intended to integrate with systems such as Spec Kit and Aegis rather tha
 M0 establishes the substrate beneath the control plane:
 
 - **M0.1 Immutable Ledger** — append-only events, actors, local consistency verification, SQLite persistence, replay/verification.
-- **M0.2 Typed Records + Graph** — records, relations, artifacts, traversal.
+- **M0.2 Typed Records + Graph** — immutable typed records/relations derived from ledger history, content-addressed artifacts, deterministic traversal and relationship paths.
 - **M0.3 Revision + Staleness** — supersession and dependency invalidation.
 - **M0.4 Evidence + Gates** — verification receipts, policy snapshots, gate decisions.
 - **M0.5 Feedback + Explainability** — runtime observations, feedback cases, `why`, `impact`, and `timeline`.
 
-The current codebase implements **M0.1**.
+The current codebase implements **M0.1 and M0.2**. Revision/staleness effects and gate authority are deliberately not implemented yet.
 
-## M0.1 quick start
+## Quick start
 
 ```bash
 python -m venv .venv
@@ -57,16 +57,35 @@ source .venv/bin/activate
 python -m pip install -e '.[dev]'
 
 sayf init .
-sayf ledger append \
-  --type RecordCreated \
-  --stream project:demo \
-  --actor-kind human \
-  --actor-id local-user \
-  --payload '{"record_id":"r1"}'
 
-sayf ledger show
+sayf record create \
+  --type Assumption \
+  --id rec_assumption \
+  --payload '{"text":"The upstream API is stable"}'
+
+sayf record create \
+  --type IntentRevision \
+  --id rec_intent \
+  --payload '{"goal":"ship the integration"}'
+
+sayf relation create \
+  --type supports \
+  --source rec_assumption \
+  --target rec_intent \
+  --id rel_support
+
+sayf graph path rec_assumption rec_intent
+
+printf 'verification receipt\n' > receipt.txt
+sayf artifact put receipt.txt \
+  --id rec_receipt \
+  --media-type text/plain
+sayf artifact verify rec_receipt
+
 sayf ledger verify
 ```
+
+## M0.1 — Immutable Ledger
 
 M0.1 accepts JSON-native event payload and actor metadata values only. Non-finite numbers, non-JSON Python objects, invalid UTF-8 text, duplicate CLI JSON keys, and non-standard JSON constants are rejected before authoritative state is created.
 
@@ -80,6 +99,24 @@ That correctness-first append policy is deliberately O(N) in current ledger leng
 
 M0.1 does **not** claim cryptographic authenticity against an adversary with arbitrary write access to the database: such an actor can rewrite records and recompute every affected hash, renumber history, or truncate the ledger tail while leaving a self-consistent local ledger. Detecting that class of attack requires an external checkpoint, signature, replicated witness, transparency log, or equivalent trust anchor. ADR-0001 records this boundary explicitly.
 
+## M0.2 — Typed Records + Graph
+
+M0.2 keeps the M0.1 SQLite v1 schema unchanged. Typed records and relations are represented by reserved immutable ledger events and replayed into a deterministic in-memory graph. The graph is a disposable projection, not a second authoritative state store.
+
+A record or relation ID is exactly its creation event ID. The typed envelopes preserve creation actor, timestamp, ledger sequence, creating event ID, schema version, canonical content hash, and structured payload/metadata. Relations are directed, may form a multigraph, and can only reference records that already exist earlier in authoritative history; forward references and dangling edges fail closed.
+
+Normal raw CLI append refuses the reserved `sayf.record.created.v1` and `sayf.relation.created.v1` event names. If a privileged low-level caller nevertheless writes malformed reserved semantic history, M0.2 projection rejects it rather than treating malformed typed state as valid.
+
+Graph neighbor queries support outbound, inbound, and combined traversal. Relationship-path searches are explicit, cycle-safe, and bounded by depth, result count, and total neighbor expansion so a query cannot silently become unbounded work. Paths expose recorded relationships; they do not infer truth or causal certainty beyond those explicit edges.
+
+Artifacts use SHA-256 content-addressed storage under `.sayf/objects/sha256/...`. Object bytes are verified against the digest, and an existing corrupt object at the expected address is rejected rather than silently overwritten. An object becomes referenced Sayf engineering state only when an immutable `Artifact` record binds its digest, byte length, metadata, actor, and creating event into the ledger. Unreferenced CAS bytes are not authoritative records.
+
+Except for the typed `Artifact` descriptor, M0.2 intentionally keeps individual record payloads as canonical JSON objects. Revision semantics, supersession effects, staleness propagation, evidence sufficiency, policy, and gates remain M0.3/M0.4 responsibilities.
+
+M0.2 currently reconstructs the graph from the fully verified event history for each operation. This is a correctness-first O(N) replay/materialization tradeoff, not a high-throughput design. Future persistent projections or checkpoints may accelerate replay only if they remain verifiable and disposable rather than becoming another source of truth.
+
+See [`docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md`](docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md) for the frozen M0.2 contract and trust boundaries.
+
 ## Design invariants
 
 1. **No silent mutation** — accepted historical state is superseded, never rewritten.
@@ -89,6 +126,7 @@ M0.1 does **not** claim cryptographic authenticity against an adversary with arb
 5. **No hidden downstream impact** — invalidated premises must be traceable to affected decisions and releases.
 6. **Unknown is not pass** — missing evidence is not successful evidence.
 7. **Unknown storage is fail-closed** — existing authority stores are validated before authoritative read or mutation.
+8. **Derived graph state is disposable** — authoritative typed history remains in immutable ledger events.
 
 ## Development
 
@@ -100,7 +138,7 @@ pytest
 
 CI executes the suite on Python 3.12 under both Ubuntu and Windows.
 
-See [`docs/architecture/VISION.md`](docs/architecture/VISION.md), [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md), and [`docs/architecture/M0_CAUSAL_LEDGER.md`](docs/architecture/M0_CAUSAL_LEDGER.md).
+See [`docs/architecture/VISION.md`](docs/architecture/VISION.md), [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md), [`docs/architecture/M0_CAUSAL_LEDGER.md`](docs/architecture/M0_CAUSAL_LEDGER.md), and [`docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md`](docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md).
 
 ## License
 
