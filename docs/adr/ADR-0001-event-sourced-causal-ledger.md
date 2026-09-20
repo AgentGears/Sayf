@@ -19,7 +19,8 @@ For the initial implementation:
 - stored timestamps and JSON documents use a canonical representation;
 - a versioned exact schema identifies a supported Sayf v1 ledger;
 - SQLite `quick_check` validates the local database container before authoritative use;
-- database triggers reject event updates and deletes during normal access;
+- database triggers reject event updates, deletes, and replacement-insert collisions during normal access;
+- first-use schema creation executes inside a single SQLite `BEGIN EXCLUSIVE` transaction, so concurrent initializers serialize through SQLite rather than relying on filesystem hard-link support;
 - a global unkeyed SHA-256 hash chain provides an internal chain-consistency check;
 - verification checks contiguous `1..N` sequence state, canonical stored representations, hash linkage, and canonical event hashes;
 - initialization, authoritative listing, and append fail closed when existing local history is invalid;
@@ -53,6 +54,7 @@ A graph database, distributed log, ORM, or event-streaming platform would add in
 - authoritative reads and writes fail closed on a locally invalid ledger;
 - malformed rows, noncanonical storage, sequence gaps, unrecomputed content changes, and chain discontinuities are detected before authoritative use;
 - unknown or damaged databases are not silently repaired or converted;
+- first-use initialization does not depend on filesystem hard-link capability;
 - supersession and invalidation can later be expressed without rewriting old semantic state;
 - adapters do not need an LLM to inspect authoritative history;
 - later projections can be rebuilt from source events;
@@ -92,6 +94,10 @@ Deferred until there is evidence that local SQLite semantics are insufficient.
 ### Trusting the stored chain head on append
 
 Rejected for M0.1 because schema-valid storage can still contain locally invalid history. Extending an unverified head would let corrupted local history become the basis for new authoritative state.
+
+### Filesystem hard-link installation
+
+Rejected because it makes otherwise-valid SQLite deployments depend on a filesystem capability that is not universally available. First-use concurrency is instead serialized by SQLite's own write-locking transaction semantics.
 
 ### External checkpointing in M0.1
 
