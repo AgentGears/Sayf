@@ -59,3 +59,24 @@ def test_missing_read_only_operations_do_not_create_coordination_sidecar(tmp_pat
 
     assert not path.exists()
     assert not lock_path.exists()
+
+
+def test_coordination_sidecar_name_is_bounded_for_long_ledger_filename(tmp_path) -> None:
+    path = tmp_path / ("l" * 240)
+    store = SQLiteEventStore(path)
+
+    assert len(os.fsencode(path.name)) == 240
+    assert len(os.fsencode(store._initialization_lock_path.name)) < 255
+    assert store._initialization_lock_path.name.startswith(".sayf-init-")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX component-limit regression")
+def test_long_ledger_filename_initializes_without_overlong_sidecar(tmp_path) -> None:
+    path = tmp_path / ("l" * 240)
+    store = SQLiteEventStore(path)
+
+    store.initialize()
+
+    result = store.verify()
+    assert result.valid is True
+    assert result.checked_events == 0
