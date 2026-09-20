@@ -41,3 +41,21 @@ def test_initialize_does_not_convert_preexisting_empty_sqlite_database(tmp_path)
             """
         ).fetchall()
     assert user_objects == []
+
+
+def test_missing_read_only_operations_do_not_create_coordination_sidecar(tmp_path) -> None:
+    path = tmp_path / "missing.sqlite3"
+    store = SQLiteEventStore(path)
+    lock_path = store._initialization_lock_path
+
+    verification = store.verify()
+    assert verification.valid is False
+    assert verification.reason == "ledger database does not exist"
+    assert not path.exists()
+    assert not lock_path.exists()
+
+    with pytest.raises(LedgerReadError, match="ledger database does not exist"):
+        store.events()
+
+    assert not path.exists()
+    assert not lock_path.exists()
