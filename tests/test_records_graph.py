@@ -115,12 +115,20 @@ def test_projection_ignores_unknown_event_types() -> None:
     assert [record.id for record in graph.records] == ["rec_a"]
 
 
-def test_projection_requires_strict_sequence_order_even_for_unknown_events() -> None:
-    with pytest.raises(GraphProjectionError, match="strictly increasing"):
+def test_projection_requires_complete_contiguous_history() -> None:
+    with pytest.raises(GraphProjectionError, match="complete contiguous"):
         CausalGraph.from_events(
             [
                 event(2, "evt_2", "custom", "custom", {}),
                 event(1, "evt_1", "custom", "custom", {}),
+            ]
+        )
+
+    with pytest.raises(GraphProjectionError, match="expected sequence 2, found 3"):
+        CausalGraph.from_events(
+            [
+                event(1, "evt_1", "custom", "custom", {}),
+                event(3, "evt_3", "custom", "custom", {}),
             ]
         )
 
