@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -129,7 +131,10 @@ class SQLiteEventStore:
     @property
     def _initialization_lock_path(self) -> Path:
         target = self.path.resolve(strict=False)
-        return target.with_name(f".{target.name}.init-lock.sqlite3")
+        coordination_key = hashlib.sha256(
+            os.fsencode(os.path.normcase(str(target)))
+        ).hexdigest()
+        return target.parent / f".sayf-init-{coordination_key}.sqlite3"
 
     @contextmanager
     def _connect(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
