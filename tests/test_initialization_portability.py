@@ -248,6 +248,60 @@ def test_pending_marker_publish_failure_leaves_no_final_marker_or_target(
     assert list(tmp_path.glob(f".{marker_path.name}.*.tmp")) == []
 
 
+def test_pending_marker_directory_sync_precedes_target_reservation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    calls = []
+
+    def record_directory_sync(directory):
+        assert directory == tmp_path
+        assert store._initialization_pending_path.exists()
+        assert not path.exists()
+        calls.append(directory)
+
+    monkeypatch.setattr(
+        SQLiteEventStore,
+        "_fsync_directory",
+        staticmethod(record_directory_sync),
+    )
+
+    store.initialize()
+
+    assert calls == [tmp_path]
+    assert store.verify().valid is True
+
+
+def test_pending_marker_directory_sync_failure_prevents_target_reservation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+
+    def fail_directory_sync(directory):
+        assert directory == tmp_path
+        assert store._initialization_pending_path.exists()
+        assert not path.exists()
+        raise OSError("forced directory sync failure")
+
+    monkeypatch.setattr(
+        SQLiteEventStore,
+        "_fsync_directory",
+        staticmethod(fail_directory_sync),
+    )
+
+    with pytest.raises(
+        LedgerReadError,
+        match="unable to create initialization pending marker",
+    ):
+        store.initialize()
+
+    assert not path.exists()
+
+
 def test_stale_pending_marker_is_cleared_after_valid_commit(tmp_path) -> None:
     path = tmp_path / "ledger.sqlite3"
     store = SQLiteEventStore(path)
