@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from threading import Barrier, Event
+
+import pytest
 
 from sayf.domain import Actor, ActorKind, EventDraft
 from sayf.storage import SQLiteEventStore
@@ -35,3 +37,30 @@ def test_concurrent_first_appends_share_one_atomic_initialization(tmp_path) -> N
     assert verification.valid is True
     assert verification.checked_events == workers
     assert {event.payload["index"] for event in store.events()} == set(range(workers))
+
+
+def test_contender_cannot_classify_in_progress_target_as_preexisting(tmp_path) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    owner = SQLiteEventStore(path)
+    contender_started = Event()
+
+    def append_from_contender():
+        contender_started.set()
+        return SQLiteEventStore(path).append(_draft(99))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with owner._initialization_guard():
+            path.touch(exist_ok=False)
+            future = executor.submit(append_from_contender)
+            assert contender_started.wait(timeout=1.0)
+
+            with pytest.raises(FutureTimeoutError):
+                future.result(timeout=0.1)
+
+            path.unlink()
+
+        event = future.result(timeout=5.0)
+
+    assert event.sequence == 1
+    assert event.payload == {"index": 99}
+    assert SQLiteEventStore(path).verify().valid is True
