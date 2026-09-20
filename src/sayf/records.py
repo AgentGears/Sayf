@@ -50,17 +50,21 @@ class RecordType(StrEnum):
     EXTERNAL_REFERENCE = "ExternalReference"
 
 
-# These names are part of the planned M0 vocabulary, but their payload and authority
-# semantics are deliberately deferred beyond M0.2. Persisting them now would freeze
-# ambiguous authoritative-looking state into an immutable history. They become
-# creatable only when the milestone that defines their contract is implemented.
-RESERVED_CONTRACT_RECORD_TYPES = frozenset(
+M04_SEMANTIC_RECORD_TYPES = frozenset(
     {
         RecordType.VERIFICATION_RECEIPT,
-        RecordType.RISK_ASSESSMENT,
         RecordType.POLICY_SNAPSHOT,
         RecordType.GATE_REQUEST,
         RecordType.GATE_DECISION,
+    }
+)
+
+# Contracts that remain intentionally unavailable after M0.4. Persisting one through
+# the generic record surface would freeze authoritative-looking state before its
+# milestone defines the payload and authority semantics.
+RESERVED_CONTRACT_RECORD_TYPES = frozenset(
+    {
+        RecordType.RISK_ASSESSMENT,
         RecordType.RELEASE,
         RecordType.RUNTIME_OBSERVATION,
         RecordType.FEEDBACK_CASE,
@@ -68,11 +72,229 @@ RESERVED_CONTRACT_RECORD_TYPES = frozenset(
 )
 
 
-def _ensure_record_type_available(record_type: RecordType) -> None:
+class VerificationResult(StrEnum):
+    PASS = "pass"
+    FAIL = "fail"
+    PARTIAL = "partial"
+    INCONCLUSIVE = "inconclusive"
+
+
+class VerificationIndependence(StrEnum):
+    YES = "yes"
+    NO = "no"
+    PARTIAL = "partial"
+    NOT_APPLICABLE = "not_applicable"
+
+
+class GateOutcome(StrEnum):
+    PERMIT = "permit"
+    BLOCK = "block"
+
+
+class RecordBinding(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    record_id: str = Field(min_length=1)
+    content_hash: str
+
+    @field_validator("record_id")
+    @classmethod
+    def normalize_record_id(cls, value: str) -> str:
+        return _normalize_text(value, "record binding id")
+
+    @field_validator("content_hash")
+    @classmethod
+    def validate_content_hash(cls, value: str) -> str:
+        value = _normalize_text(value, "record binding content hash")
+        if not _SHA256_RE.fullmatch(value):
+            raise ValueError("record binding hash must be lowercase sha256:<64 hex>")
+        return value
+
+
+class VerificationRequirement(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    contract: str = Field(min_length=1)
+    minimum_passes: int = Field(default=1, ge=1)
+
+    @field_validator("contract")
+    @classmethod
+    def normalize_contract(cls, value: str) -> str:
+        return _normalize_text(value, "verification contract")
+
+
+class VerificationReceiptPayload(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    subject: RecordBinding
+    contract: str = Field(min_length=1)
+    result: VerificationResult
+    evidence: tuple[RecordBinding, ...] = Field(min_length=1)
+    environment: dict[str, Any] = Field(min_length=1)
+    limitations: tuple[str, ...] = ()
+    independent_from_generation: VerificationIndependence
+    verified_claim: str | None = None
+    prohibited_generalizations: tuple[str, ...] = ()
+
+    @field_validator("contract")
+    @classmethod
+    def normalize_contract(cls, value: str) -> str:
+        return _normalize_text(value, "verification contract")
+
+    @field_validator("environment", mode="before")
+    @classmethod
+    def normalize_environment(cls, value: Any) -> dict[str, Any]:
+        return _normalize_json_object(value, "verification environment")
+
+    @field_validator("limitations", "prohibited_generalizations")
+    @classmethod
+    def normalize_text_tuple(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(_normalize_text(item, "verification text") for item in value)
+
+    @field_validator("verified_claim")
+    @classmethod
+    def normalize_verified_claim(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = _normalize_text(value, "verified claim")
+        if not value:
+            raise ValueError("verified claim must not be empty")
+        return value
+
+    @model_validator(mode="after")
+    def validate_receipt_semantics(self) -> VerificationReceiptPayload:
+        evidence_ids = [binding.record_id for binding in self.evidence]
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("verification evidence bindings must be unique by record id")
+        if self.result is VerificationResult.PASS and self.verified_claim is None:
+            raise ValueError("pass verification requires a bounded verified_claim")
+        if self.result in {VerificationResult.FAIL, VerificationResult.INCONCLUSIVE}:
+            if self.verified_claim is not None:
+                raise ValueError(
+                    "fail/inconclusive verification must not assert a verified_claim"
+                )
+        return self
+
+
+class PolicySnapshotPayload(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str = Field(min_length=1)
+    requirements: tuple[VerificationRequirement, ...] = Field(min_length=1)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        return _normalize_text(value, "policy snapshot name")
+
+    @model_validator(mode="after")
+    def validate_unique_contracts(self) -> PolicySnapshotPayload:
+        contracts = [requirement.contract for requirement in self.requirements]
+        if len(contracts) != len(set(contracts)):
+            raise ValueError("policy verification contracts must be unique")
+        return self
+
+
+class GateRequestPayload(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    subject: RecordBinding
+    policy_snapshot: RecordBinding
+    verification_receipts: tuple[RecordBinding, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_unique_receipts(self) -> GateRequestPayload:
+        receipt_ids = [binding.record_id for binding in self.verification_receipts]
+        if len(receipt_ids) != len(set(receipt_ids)):
+            raise ValueError("gate request receipt bindings must be unique by record id")
+        return self
+
+
+class GateInputBinding(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    record_id: str = Field(min_length=1)
+    content_hash: str
+    effective_state_hash: str
+
+    @field_validator("record_id")
+    @classmethod
+    def normalize_record_id(cls, value: str) -> str:
+        return _normalize_text(value, "gate input record id")
+
+    @field_validator("content_hash", "effective_state_hash")
+    @classmethod
+    def validate_hash(cls, value: str) -> str:
+        value = _normalize_text(value, "gate input hash")
+        if not _SHA256_RE.fullmatch(value):
+            raise ValueError("gate input hashes must be lowercase sha256:<64 hex>")
+        return value
+
+
+class GateDecisionPayload(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    gate_request: RecordBinding
+    subject: RecordBinding
+    policy_snapshot: RecordBinding
+    verification_receipts: tuple[RecordBinding, ...]
+    evaluated_inputs: tuple[GateInputBinding, ...] = Field(min_length=3)
+    outcome: GateOutcome
+    reasons: tuple[str, ...] = ()
+    satisfied_requirements: tuple[str, ...] = ()
+    missing_requirements: tuple[str, ...] = ()
+
+    @field_validator("reasons", "satisfied_requirements", "missing_requirements")
+    @classmethod
+    def normalize_text_tuple(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(_normalize_text(item, "gate decision text") for item in value)
+
+    @model_validator(mode="after")
+    def validate_decision_shape(self) -> GateDecisionPayload:
+        receipt_ids = [binding.record_id for binding in self.verification_receipts]
+        if len(receipt_ids) != len(set(receipt_ids)):
+            raise ValueError("gate decision receipt bindings must be unique by record id")
+        input_ids = [binding.record_id for binding in self.evaluated_inputs]
+        if len(input_ids) != len(set(input_ids)):
+            raise ValueError("gate evaluated inputs must be unique by record id")
+        if self.outcome is GateOutcome.PERMIT and self.reasons:
+            raise ValueError("permit gate decision must not contain blocking reasons")
+        if self.outcome is GateOutcome.PERMIT and self.missing_requirements:
+            raise ValueError("permit gate decision must not have missing requirements")
+        if self.outcome is GateOutcome.BLOCK and not self.reasons:
+            raise ValueError("block gate decision requires at least one reason")
+        return self
+
+
+_M04_PAYLOAD_MODELS: dict[RecordType, type[BaseModel]] = {
+    RecordType.VERIFICATION_RECEIPT: VerificationReceiptPayload,
+    RecordType.POLICY_SNAPSHOT: PolicySnapshotPayload,
+    RecordType.GATE_REQUEST: GateRequestPayload,
+    RecordType.GATE_DECISION: GateDecisionPayload,
+}
+
+
+def _validate_semantic_payload(record_type: RecordType, payload: dict[str, Any]) -> dict[str, Any]:
+    model_type = _M04_PAYLOAD_MODELS.get(record_type)
+    if model_type is None:
+        return payload
+    return model_type.model_validate(payload).model_dump(mode="python")
+
+
+def _ensure_record_type_contract_implemented(record_type: RecordType) -> None:
     if record_type in RESERVED_CONTRACT_RECORD_TYPES:
         raise ValueError(
             f"record type {record_type.value} is reserved until its semantic contract "
             "is implemented"
+        )
+
+
+def _ensure_generic_record_creation_allowed(record_type: RecordType) -> None:
+    _ensure_record_type_contract_implemented(record_type)
+    if record_type in M04_SEMANTIC_RECORD_TYPES:
+        raise ValueError(
+            f"record type {record_type.value} must be created through its M0.4 "
+            "semantic API"
         )
 
 
@@ -157,7 +379,7 @@ class RecordDraft(BaseModel):
 
     @model_validator(mode="after")
     def validate_typed_payload(self) -> RecordDraft:
-        _ensure_record_type_available(self.record_type)
+        _ensure_generic_record_creation_allowed(self.record_type)
         if self.record_type is RecordType.ARTIFACT:
             ArtifactDescriptor.model_validate(self.payload)
         return self
@@ -207,9 +429,11 @@ class RecordCreatedPayload(BaseModel):
 
     @model_validator(mode="after")
     def validate_typed_payload(self) -> RecordCreatedPayload:
-        _ensure_record_type_available(self.record_type)
+        _ensure_record_type_contract_implemented(self.record_type)
         if self.record_type is RecordType.ARTIFACT:
             ArtifactDescriptor.model_validate(self.payload)
+        elif self.record_type in M04_SEMANTIC_RECORD_TYPES:
+            _validate_semantic_payload(self.record_type, self.payload)
         return self
 
 
@@ -323,6 +547,32 @@ def record_event_payload(draft: RecordDraft) -> dict[str, Any]:
     }
 
 
+def semantic_record_event_payload(
+    record_type: RecordType,
+    payload: BaseModel | dict[str, Any],
+) -> dict[str, Any]:
+    if record_type not in M04_SEMANTIC_RECORD_TYPES:
+        raise ValueError(f"record type {record_type.value} is not an M0.4 semantic record")
+    payload_value = (
+        payload.model_dump(mode="python")
+        if isinstance(payload, BaseModel)
+        else _normalize_json_object(payload, "semantic record payload")
+    )
+    payload_value = _validate_semantic_payload(record_type, payload_value)
+    return {
+        "record_type": record_type.value,
+        "schema_version": RECORD_SCHEMA_VERSION,
+        "content_hash": _content_hash(
+            {
+                "record_type": record_type.value,
+                "schema_version": RECORD_SCHEMA_VERSION,
+                "payload": payload_value,
+            }
+        ),
+        "payload": payload_value,
+    }
+
+
 def relation_event_payload(draft: RelationDraft) -> dict[str, Any]:
     return {
         "relation_type": draft.relation_type.value,
@@ -341,11 +591,16 @@ def record_from_event(event: LedgerEvent) -> Record:
         raise ValueError("record creation event stream does not match event/record id")
 
     payload = RecordCreatedPayload.model_validate(event.payload)
+    normalized_payload = (
+        _validate_semantic_payload(payload.record_type, payload.payload)
+        if payload.record_type in M04_SEMANTIC_RECORD_TYPES
+        else payload.payload
+    )
     expected_hash = _content_hash(
         {
             "record_type": payload.record_type.value,
             "schema_version": payload.schema_version,
-            "payload": payload.payload,
+            "payload": normalized_payload,
         }
     )
     if payload.content_hash != expected_hash:
@@ -360,7 +615,7 @@ def record_from_event(event: LedgerEvent) -> Record:
         created_sequence=event.sequence,
         creating_event_id=event.event_id,
         content_hash=payload.content_hash,
-        payload=payload.payload,
+        payload=normalized_payload,
     )
 
 
