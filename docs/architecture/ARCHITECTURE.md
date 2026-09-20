@@ -59,14 +59,15 @@ M0 uses:
 - canonical stored representations for timestamps and structured event data;
 - complete local-history verification before authoritative listing or append;
 - a non-authoritative SQLite coordination sidecar for cross-process first-use ownership;
+- a small non-authoritative pending-initialization marker for crash recovery;
 - filesystem content-addressed storage for larger immutable artifacts (M0.2+);
 - generated Markdown/JSON projections for humans and adapters.
 
-Human-readable projections are never authoritative storage. The initialization sidecar is also non-authoritative: it exists only to provide a cross-process SQLite lock before the target ledger path is inspected.
+Human-readable projections are never authoritative storage. The initialization sidecar and pending marker are also non-authoritative: the sidecar provides a cross-process SQLite lock before the target ledger path is inspected, while the marker records only that Sayf had begun creating that exact target under the barrier.
 
 Initialization is creation-only and idempotent for an already locally valid ledger. It does not silently repair, migrate, convert, or legitimize an existing unknown, damaged, or history-invalid database. Repair and migration require explicit future operations.
 
-For first use, Sayf first acquires an exclusive transaction on the coordination sidecar. Only the lock owner may then inspect the target path. If the target is absent, the owner reserves it with exclusive file creation and creates the schema inside one SQLite transaction. This ordering prevents a contender from classifying another Sayf process's in-progress target as pre-existing storage, while avoiding filesystem hard-link requirements. Appends pass through the same barrier before the normal `BEGIN IMMEDIATE` append transaction.
+For first use, Sayf first acquires an exclusive transaction on the coordination sidecar. Coordination names are fixed-length hashes of the normalized, case-folded resolved target path, conservatively folding lexical aliases that may refer to the same target on case-insensitive filesystems. Only the lock owner may inspect the target path. If the target is absent, the owner writes the pending marker, reserves the target with exclusive file creation, and creates the schema inside one SQLite transaction. If the process or host stops before commit, the marker survives independently of the target transaction; the next lock owner may recover only a marker-backed target that remains schema-less SQLite storage. A non-Sayf or user-schema-bearing target is still rejected. If the ledger committed successfully but marker cleanup did not complete, the next initializer validates the ledger and then clears the stale marker. This ordering prevents a contender from classifying another Sayf process's in-progress target as pre-existing storage, while avoiding filesystem hard-link requirements. Appends pass through the same barrier before the normal `BEGIN IMMEDIATE` append transaction.
 
 Appending currently re-verifies the complete existing local history inside the immediate write transaction. That is intentionally O(N) per append in M0.1; optimization is deferred until it can preserve the same fail-closed authority boundary.
 
@@ -106,6 +107,7 @@ M0.1 implements the generic immutable event substrate before introducing these h
 - SQLite container integrity check;
 - versioned exact schema/metadata identity;
 - pre-creation, cross-process first-use coordination using SQLite locking;
+- crash-recoverable first-use ownership without legitimizing arbitrary storage;
 - local history consistency verification;
 - fail-closed authoritative replay/listing and append;
 - CLI and CI tests on Ubuntu and Windows.
