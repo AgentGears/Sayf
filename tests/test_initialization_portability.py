@@ -302,6 +302,46 @@ def test_pending_marker_directory_sync_failure_prevents_target_reservation(
     assert not path.exists()
 
 
+def test_retry_revalidates_surviving_marker_durability_before_target_reservation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    sync_calls = 0
+
+    def transient_directory_sync(directory):
+        nonlocal sync_calls
+        sync_calls += 1
+        assert directory == tmp_path
+        assert store._initialization_pending_path.exists()
+        assert not path.exists()
+        if sync_calls == 1:
+            raise OSError("transient directory sync failure")
+
+    monkeypatch.setattr(
+        SQLiteEventStore,
+        "_fsync_directory",
+        staticmethod(transient_directory_sync),
+    )
+
+    with pytest.raises(
+        LedgerReadError,
+        match="unable to create initialization pending marker",
+    ):
+        store.initialize()
+
+    assert store._initialization_pending_path.exists()
+    assert not path.exists()
+
+    store.initialize()
+
+    assert sync_calls == 2
+    assert store.verify().valid is True
+    assert path.exists()
+    assert not store._initialization_pending_path.exists()
+
+
 def test_stale_pending_marker_is_cleared_after_valid_commit(tmp_path) -> None:
     path = tmp_path / "ledger.sqlite3"
     store = SQLiteEventStore(path)
