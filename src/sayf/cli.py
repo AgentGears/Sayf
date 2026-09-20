@@ -121,7 +121,7 @@ def append_event(
         draft = EventDraft(
             stream_id=stream,
             event_type=event_type,
-            actor=_actor(actor_kind, actor_id),
+            actor=Actor(kind=actor_kind, id=actor_id),
             payload=payload_value,
         )
     except ValidationError as exc:
