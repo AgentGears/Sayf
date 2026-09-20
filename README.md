@@ -43,11 +43,11 @@ M0 establishes the substrate beneath the control plane:
 
 - **M0.1 Immutable Ledger** — append-only events, actors, local consistency verification, SQLite persistence, replay/verification.
 - **M0.2 Typed Records + Graph** — immutable typed records/relations derived from ledger history, content-addressed artifacts, deterministic traversal and relationship paths.
-- **M0.3 Revision + Staleness** — supersession and dependency invalidation.
+- **M0.3 Revision + Staleness** — explicit relation qualification, invalidation, linear supersession, and deterministic dependency staleness.
 - **M0.4 Evidence + Gates** — verification receipts, policy snapshots, gate decisions.
 - **M0.5 Feedback + Explainability** — runtime observations, feedback cases, `why`, `impact`, and `timeline`.
 
-The current codebase implements **M0.1 and M0.2**. Revision/staleness effects and gate authority are deliberately not implemented yet.
+The current codebase implements **M0.1, M0.2, and M0.3**. Evidence sufficiency, gate authority, release authority, and runtime feedback remain deliberately deferred.
 
 ## Quick start
 
@@ -69,12 +69,27 @@ sayf record create \
   --payload '{"goal":"ship the integration"}'
 
 sayf relation create \
-  --type supports \
-  --source rec_assumption \
-  --target rec_intent \
-  --id rel_support
+  --type depends_on \
+  --source rec_intent \
+  --target rec_assumption \
+  --id rel_intent_assumption
 
-sayf graph path rec_assumption rec_intent
+sayf state bind-dependency rel_intent_assumption
+
+sayf record create \
+  --type Observation \
+  --id rec_observation \
+  --payload '{"result":"upstream contract changed"}'
+
+sayf relation create \
+  --type invalidates \
+  --source rec_observation \
+  --target rec_assumption \
+  --id rel_observation_invalidates_assumption
+
+sayf state invalidate rel_observation_invalidates_assumption
+sayf state show rec_intent
+sayf state affected rec_assumption
 
 printf 'verification receipt\n' > receipt.txt
 sayf artifact put receipt.txt \
@@ -115,24 +130,59 @@ Artifacts use SHA-256 content-addressed storage under `.sayf/objects/sha256/...`
 
 Except for the typed `Artifact` descriptor, active M0.2 record payloads are canonical JSON objects. Names whose semantics would imply verification, policy/gate authority, release status, or runtime feedback are enumerated for the planned M0 vocabulary but are mechanically reserved until their later milestone contracts exist: `VerificationReceipt`, `RiskAssessment`, `PolicySnapshot`, `GateRequest`, `GateDecision`, `Release`, `RuntimeObservation`, and `FeedbackCase`. This prevents an immutable generic JSON object from acquiring apparent authority merely because it was given a future authoritative type name.
 
-Revision semantics, supersession effects, staleness propagation, evidence sufficiency, policy, and gates remain M0.3/M0.4 responsibilities.
+M0.2 relationship claims remain distinct from M0.3 state authority. In particular, `depends_on`, `invalidates`, and `supersedes` relations have no state consequence until an explicit M0.3 qualification event adopts that exact relation.
 
-M0.2 currently reconstructs the graph from the fully verified event history for each operation. Typed writes then re-verify the ledger under the append transaction before comparing the semantic snapshot head. This is a correctness-first O(N) replay/verification tradeoff, not a high-throughput design. Future persistent projections or checkpoints may accelerate replay only if they remain verifiable and disposable rather than becoming another source of truth.
+M0.2 reconstructs the graph from the fully verified event history for each operation. Typed writes then re-verify the ledger under the append transaction before comparing the semantic snapshot head. This is a correctness-first O(N) replay/verification tradeoff, not a high-throughput design. Future persistent projections or checkpoints may accelerate replay only if they remain verifiable and disposable rather than becoming another source of truth.
 
 See [`docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md`](docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md) for the frozen M0.2 contract and trust boundaries.
+
+## M0.3 — Revision + Staleness
+
+M0.3 preserves the M0.2 distinction between a recorded relationship claim and authoritative effective state. Three new immutable event types qualify an already-existing relation by exact relation ID and relation content hash:
+
+```text
+sayf.dependency.bound.v1
+sayf.record.invalidated.v1
+sayf.record.superseded.v1
+```
+
+Only a qualified `depends_on` edge participates in staleness propagation. A qualified `invalidates` edge marks its target invalidated. A qualified `supersedes` edge marks the old target revision superseded and requires source/target records of the same type. M0.3 intentionally supports a linear supersession lineage and fails ambiguous branching/merge semantics closed.
+
+Effective state exposes three independent axes rather than one overloaded status:
+
+```text
+validity:   not_invalidated | invalidated
+revision:   current | superseded
+freshness:  fresh | stale
+```
+
+The labels deliberately stop short of positive authority claims. `not_invalidated` means only that no qualified invalidation exists; `current` means only that no qualified supersession exists; and `fresh` means only that no qualified dependency path currently reaches an invalidated or superseded root. They do not mean true, accepted, verified, complete, safe, or pass.
+
+Invalidated and superseded records are staleness roots. Their qualified transitive dependents become stale. Each stale record carries a deterministic canonical dependency path back to each root so the reason for staleness remains mechanically inspectable.
+
+State transitions validate a complete semantic snapshot and use the M0.2 compare-and-append boundary, so any concurrent ledger change between validation and append forces revalidation. Malformed privileged M0.3 state history blocks subsequent semantic operations fail-closed.
+
+The M0.3 actor field is provenance, not an authorization system. In the local-first milestone, permission to invoke a state-transition API comes from the host/application boundary. An agent-authored relation does not become effective merely because it exists; a caller with transition authority must explicitly qualify it. Policy-bound authorization remains an M0.4+ concern.
+
+Effective-state projection is correctness-first and currently recomputes from fully verified history. Staleness derivation may revisit the qualified dependency graph once per invalidated/superseded root, so this is not yet a high-throughput design. Persistent projections or incremental invalidation indexes should be introduced only after measurement establishes a forcing function and only if they remain verifiable, disposable acceleration state.
+
+`state affected` is intentionally narrower than the future M0.5 `impact` query: it reports records currently stale because the requested record is an invalidated or superseded root. It does not claim to enumerate policy, gate, release, or runtime consequences.
+
+See [`docs/architecture/M0_3_REVISION_STALENESS.md`](docs/architecture/M0_3_REVISION_STALENESS.md) for the M0.3 contract, qualification boundary, and acceptance slice.
 
 ## Design invariants
 
 1. **No silent mutation** — accepted historical state is superseded, never rewritten.
 2. **No missing provenance** — durable state identifies the actor and event that created it.
-3. **No unsupported authority** — an agent assertion or future authority-looking type name is not authoritative merely because it was emitted.
-4. **No stale reuse** — authoritative decisions bind exact versions of their inputs; M0.2 typed writes bind the exact ledger head they semantically validated.
-5. **No hidden downstream impact** — invalidated premises must be traceable to affected decisions and releases.
-6. **Unknown is not pass** — missing evidence is not successful evidence.
+3. **No unsupported authority** — an agent assertion or relation label is not authoritative merely because it was emitted.
+4. **No stale reuse** — typed/state writes bind the exact ledger head whose semantics they validated.
+5. **No hidden downstream impact** — invalidated or superseded premises expose qualified stale dependents and canonical dependency paths.
+6. **Unknown is not pass** — absence of invalidation, supersession, or staleness is not promoted into truth, acceptance, verification, or pass.
 7. **Unknown storage is fail-closed** — existing authority stores are validated before authoritative read or mutation.
-8. **Derived graph state is disposable** — authoritative typed history remains in immutable ledger events.
+8. **Derived semantic state is disposable** — authoritative history remains in immutable ledger events.
 9. **Bounded queries are explicit** — relationship-path limits fail rather than silently presenting partial results as complete.
 10. **CAS publication is no-clobber** — an existing or racing digest address is verified/reused or rejected, never overwritten by normal publication.
+11. **Relation claim is not adoption** — M0.3 state consequences require explicit qualification of an exact immutable relation.
 
 ## Development
 
@@ -144,7 +194,7 @@ pytest
 
 CI executes the suite on Python 3.12 under both Ubuntu and Windows.
 
-See [`docs/architecture/VISION.md`](docs/architecture/VISION.md), [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md), [`docs/architecture/M0_CAUSAL_LEDGER.md`](docs/architecture/M0_CAUSAL_LEDGER.md), and [`docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md`](docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md).
+See [`docs/architecture/VISION.md`](docs/architecture/VISION.md), [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md), [`docs/architecture/M0_CAUSAL_LEDGER.md`](docs/architecture/M0_CAUSAL_LEDGER.md), [`docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md`](docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md), and [`docs/architecture/M0_3_REVISION_STALENESS.md`](docs/architecture/M0_3_REVISION_STALENESS.md).
 
 ## License
 
