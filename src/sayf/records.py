@@ -278,7 +278,7 @@ def _validate_semantic_payload(record_type: RecordType, payload: dict[str, Any])
     model_type = _M04_PAYLOAD_MODELS.get(record_type)
     if model_type is None:
         return payload
-    return model_type.model_validate(payload).model_dump(mode="python")
+    return model_type.model_validate(payload).model_dump(mode="json")
 
 
 def _ensure_record_type_contract_implemented(record_type: RecordType) -> None:
@@ -554,7 +554,7 @@ def semantic_record_event_payload(
     if record_type not in M04_SEMANTIC_RECORD_TYPES:
         raise ValueError(f"record type {record_type.value} is not an M0.4 semantic record")
     payload_value = (
-        payload.model_dump(mode="python")
+        payload.model_dump(mode="json")
         if isinstance(payload, BaseModel)
         else _normalize_json_object(payload, "semantic record payload")
     )
