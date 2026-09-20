@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
@@ -16,6 +17,7 @@ from sayf.hashing import canonical_json, compute_event_hash
 
 _LEDGER_SCHEMA_VERSION = "1"
 _IMMUTABILITY_MESSAGE = "Sayf ledger events are immutable"
+_PENDING_INITIALIZATION_MARKER = b"sayf-initialization-pending-v1\n"
 
 _META_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS sayf_ledger_meta (
@@ -129,12 +131,27 @@ class SQLiteEventStore:
         self.path = Path(path)
 
     @property
+    def _initialization_coordination_key(self) -> str:
+        target = self.path.resolve(strict=False)
+        normalized_target = unicodedata.normalize(
+            "NFC",
+            os.path.normcase(str(target)),
+        ).casefold()
+        return hashlib.sha256(os.fsencode(normalized_target)).hexdigest()
+
+    @property
     def _initialization_lock_path(self) -> Path:
         target = self.path.resolve(strict=False)
-        coordination_key = hashlib.sha256(
-            os.fsencode(os.path.normcase(str(target)))
-        ).hexdigest()
-        return target.parent / f".sayf-init-{coordination_key}.sqlite3"
+        return target.parent / (
+            f".sayf-init-{self._initialization_coordination_key}.sqlite3"
+        )
+
+    @property
+    def _initialization_pending_path(self) -> Path:
+        target = self.path.resolve(strict=False)
+        return target.parent / (
+            f".sayf-init-{self._initialization_coordination_key}.pending"
+        )
 
     @contextmanager
     def _connect(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
@@ -168,7 +185,7 @@ class SQLiteEventStore:
             connection.execute("BEGIN EXCLUSIVE")
             integrity = [
                 str(row[0])
-                for row in connection.execute("PRAGMA quick_check").fetchall()
+                for row in connection.execute("PRAGMA quick_check(1)").fetchall()
             ]
             if integrity != ["ok"]:
                 detail = "; ".join(integrity) if integrity else "no result"
@@ -191,6 +208,67 @@ class SQLiteEventStore:
         finally:
             connection.close()
 
+    def _pending_initialization_exists(self) -> bool:
+        marker_path = self._initialization_pending_path
+        if not marker_path.exists():
+            return False
+        if not marker_path.is_file():
+            raise LedgerReadError("initialization pending marker is not a file")
+
+        try:
+            with marker_path.open("rb") as marker:
+                content = marker.read(len(_PENDING_INITIALIZATION_MARKER) + 1)
+        except OSError as exc:
+            raise LedgerReadError(
+                f"unable to read initialization pending marker: {exc}"
+            ) from exc
+
+        if content != _PENDING_INITIALIZATION_MARKER:
+            raise LedgerReadError("initialization pending marker is malformed")
+        return True
+
+    def _ensure_pending_initialization_marker(self) -> bool:
+        marker_path = self._initialization_pending_path
+        if self._pending_initialization_exists():
+            return False
+
+        try:
+            with marker_path.open("xb") as marker:
+                marker.write(_PENDING_INITIALIZATION_MARKER)
+                marker.flush()
+                os.fsync(marker.fileno())
+            return True
+        except FileExistsError:
+            self._pending_initialization_exists()
+            return False
+        except OSError as exc:
+            raise LedgerReadError(
+                f"unable to create initialization pending marker: {exc}"
+            ) from exc
+
+    def _clear_pending_initialization_marker(self) -> None:
+        try:
+            self._initialization_pending_path.unlink(missing_ok=True)
+        except OSError:
+            # The ledger is already authoritative at this point. A leftover marker is
+            # safe: the next initializer validates the ledger before clearing it.
+            pass
+
+    def _validate_recoverable_pending_target(self) -> None:
+        try:
+            with self._connect() as connection:
+                self._validate_sqlite_integrity(connection)
+                if self._has_user_schema_objects(connection):
+                    raise LedgerReadError(
+                        "interrupted initialization target contains user schema objects"
+                    )
+        except LedgerReadError:
+            raise
+        except sqlite3.Error as exc:
+            raise LedgerReadError(
+                f"interrupted initialization target is not recoverable SQLite storage: {exc}"
+            ) from exc
+
     @contextmanager
     def _read_connection(self) -> Iterator[sqlite3.Connection]:
         if not self.path.exists():
@@ -208,54 +286,65 @@ class SQLiteEventStore:
             raise LedgerReadError(f"unable to read ledger database: {exc}") from exc
 
     def initialize(self) -> None:
-        created_here = False
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self._initialization_guard():
+                pending = self._pending_initialization_exists()
+
                 if self.path.exists():
                     if not self.path.is_file():
                         raise LedgerReadError("ledger database path is not a file")
-                    self._validate_existing_ledger()
-                    return
 
-                try:
-                    with self.path.open("xb"):
-                        pass
-                    created_here = True
-                except FileExistsError as exc:
-                    raise LedgerReadError(
-                        "ledger database appeared outside Sayf initialization coordination"
-                    ) from exc
-
-                try:
-                    with self._connect() as connection:
-                        try:
-                            connection.execute("BEGIN EXCLUSIVE")
-                            if self._has_user_schema_objects(connection):
-                                raise LedgerReadError(
-                                    "new ledger database unexpectedly contains schema objects"
-                                )
-                            for statement in _SCHEMA_STATEMENTS:
-                                connection.execute(statement)
-
-                            self._validate_database(connection)
-                            verification, _, _ = self._verify_connection(connection)
-                            if not verification.valid:
-                                raise LedgerReadError(
-                                    self._verification_error(verification)
-                                )
-                            connection.execute("COMMIT")
-                            created_here = False
-                        except Exception:
-                            if connection.in_transaction:
-                                connection.execute("ROLLBACK")
+                    try:
+                        self._validate_existing_ledger()
+                    except LedgerReadError:
+                        if not pending:
                             raise
-                finally:
-                    if created_here:
-                        try:
-                            self.path.unlink(missing_ok=True)
-                        except OSError:
+                        self._validate_recoverable_pending_target()
+                    else:
+                        if pending:
+                            self._clear_pending_initialization_marker()
+                        return
+                else:
+                    marker_created_here = False
+                    if not pending:
+                        marker_created_here = self._ensure_pending_initialization_marker()
+
+                    try:
+                        with self.path.open("xb"):
                             pass
+                    except FileExistsError as exc:
+                        if marker_created_here:
+                            self._clear_pending_initialization_marker()
+                        raise LedgerReadError(
+                            "ledger database appeared outside Sayf initialization coordination"
+                        ) from exc
+                    except OSError:
+                        if marker_created_here:
+                            self._clear_pending_initialization_marker()
+                        raise
+
+                with self._connect() as connection:
+                    try:
+                        connection.execute("BEGIN EXCLUSIVE")
+                        if self._has_user_schema_objects(connection):
+                            raise LedgerReadError(
+                                "new ledger database unexpectedly contains schema objects"
+                            )
+                        for statement in _SCHEMA_STATEMENTS:
+                            connection.execute(statement)
+
+                        self._validate_database(connection)
+                        verification, _, _ = self._verify_connection(connection)
+                        if not verification.valid:
+                            raise LedgerReadError(self._verification_error(verification))
+                        connection.execute("COMMIT")
+                    except Exception:
+                        if connection.in_transaction:
+                            connection.execute("ROLLBACK")
+                        raise
+
+                self._clear_pending_initialization_marker()
         except LedgerReadError:
             raise
         except (OSError, sqlite3.Error) as exc:
@@ -530,7 +619,10 @@ class SQLiteEventStore:
 
     @staticmethod
     def _validate_sqlite_integrity(connection: sqlite3.Connection) -> None:
-        results = [str(row[0]) for row in connection.execute("PRAGMA quick_check").fetchall()]
+        results = [
+            str(row[0])
+            for row in connection.execute("PRAGMA quick_check(1)").fetchall()
+        ]
         if results != ["ok"]:
             detail = "; ".join(results) if results else "no result"
             raise LedgerReadError(f"SQLite quick_check failed: {detail}")
@@ -550,13 +642,18 @@ class SQLiteEventStore:
         ]:
             raise LedgerReadError("Sayf ledger schema marker is malformed")
 
-        metadata_rows = connection.execute(
+        metadata_cursor = connection.execute(
             "SELECT key, value FROM sayf_ledger_meta ORDER BY key"
-        ).fetchall()
-        metadata = [(str(row["key"]), str(row["value"])) for row in metadata_rows]
-        if len(metadata) != 1 or metadata[0][0] != "schema_version":
+        )
+        first_metadata = metadata_cursor.fetchone()
+        second_metadata = metadata_cursor.fetchone()
+        if (
+            first_metadata is None
+            or second_metadata is not None
+            or str(first_metadata["key"]) != "schema_version"
+        ):
             raise LedgerReadError("Sayf ledger metadata is unsupported or malformed")
-        if metadata[0][1] != _LEDGER_SCHEMA_VERSION:
+        if str(first_metadata["value"]) != _LEDGER_SCHEMA_VERSION:
             raise LedgerReadError("Sayf ledger schema version is unsupported")
 
         rows = connection.execute(
@@ -564,7 +661,9 @@ class SQLiteEventStore:
             SELECT type, name, sql FROM sqlite_master
             WHERE name NOT LIKE 'sqlite_%'
               AND type IN ('table', 'index', 'trigger', 'view')
-            """
+            LIMIT ?
+            """,
+            (len(_EXPECTED_SCHEMA_OBJECTS) + 1,),
         ).fetchall()
         actual_objects = {
             (str(row["type"]), str(row["name"])): _normalize_schema_sql(
