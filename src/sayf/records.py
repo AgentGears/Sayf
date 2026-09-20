@@ -50,6 +50,32 @@ class RecordType(StrEnum):
     EXTERNAL_REFERENCE = "ExternalReference"
 
 
+# These names are part of the planned M0 vocabulary, but their payload and authority
+# semantics are deliberately deferred beyond M0.2. Persisting them now would freeze
+# ambiguous authoritative-looking state into an immutable history. They become
+# creatable only when the milestone that defines their contract is implemented.
+RESERVED_CONTRACT_RECORD_TYPES = frozenset(
+    {
+        RecordType.VERIFICATION_RECEIPT,
+        RecordType.RISK_ASSESSMENT,
+        RecordType.POLICY_SNAPSHOT,
+        RecordType.GATE_REQUEST,
+        RecordType.GATE_DECISION,
+        RecordType.RELEASE,
+        RecordType.RUNTIME_OBSERVATION,
+        RecordType.FEEDBACK_CASE,
+    }
+)
+
+
+def _ensure_record_type_available(record_type: RecordType) -> None:
+    if record_type in RESERVED_CONTRACT_RECORD_TYPES:
+        raise ValueError(
+            f"record type {record_type.value} is reserved until its semantic contract "
+            "is implemented"
+        )
+
+
 class RelationType(StrEnum):
     SUPPORTS = "supports"
     CONTRADICTS = "contradicts"
@@ -131,6 +157,7 @@ class RecordDraft(BaseModel):
 
     @model_validator(mode="after")
     def validate_typed_payload(self) -> RecordDraft:
+        _ensure_record_type_available(self.record_type)
         if self.record_type is RecordType.ARTIFACT:
             ArtifactDescriptor.model_validate(self.payload)
         return self
@@ -180,6 +207,7 @@ class RecordCreatedPayload(BaseModel):
 
     @model_validator(mode="after")
     def validate_typed_payload(self) -> RecordCreatedPayload:
+        _ensure_record_type_available(self.record_type)
         if self.record_type is RecordType.ARTIFACT:
             ArtifactDescriptor.model_validate(self.payload)
         return self
