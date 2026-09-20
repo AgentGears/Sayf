@@ -72,7 +72,7 @@ def test_unqualified_m02_relations_do_not_gain_m03_authority(tmp_path: Path) -> 
     state = repo.effective_state()
     for record_id in ("a1", "i1", "i2", "o1"):
         effective = state.state(record_id)
-        assert effective.validity is ValidityState.VALID
+        assert effective.validity is ValidityState.NOT_INVALIDATED
         assert effective.revision is RevisionState.CURRENT
         assert effective.freshness is FreshnessState.FRESH
 
@@ -101,7 +101,7 @@ def test_invalidation_propagates_transitively_over_bound_dependencies(
     assert assumption.invalidated_by_record_ids == ("o1",)
 
     intent = state.state("i1")
-    assert intent.validity is ValidityState.VALID
+    assert intent.validity is ValidityState.NOT_INVALIDATED
     assert intent.freshness is FreshnessState.STALE
     assert intent.stale_causes[0].root_record_id == "a1"
     assert intent.stale_causes[0].root_kind is StalenessRootKind.INVALIDATED
