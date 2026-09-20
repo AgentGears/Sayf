@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from sayf.artifacts import ArtifactVerification, ContentAddressedArtifactStore
 from sayf.domain import Actor, EventDraft
@@ -20,6 +21,16 @@ from sayf.records import (
     relation_from_event,
 )
 from sayf.storage import LedgerReadError, SQLiteEventStore
+
+
+def _validate_requested_record_id(record_id: Any) -> str:
+    if not isinstance(record_id, str) or not record_id:
+        raise ValueError("record id must be a non-empty string")
+    try:
+        record_id.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("record id must be valid UTF-8 text") from exc
+    return record_id
 
 
 class CausalRepository:
@@ -103,23 +114,24 @@ class CausalRepository:
         actor: Actor,
         media_type: str | None = None,
         name: str | None = None,
-        metadata: dict | None = None,
+        metadata: dict[str, Any] | None = None,
         record_id: str | None = None,
     ) -> tuple[Record, ArtifactDescriptor]:
-        if record_id is not None:
-            RecordDraft(record_type=RecordType.CLAIM, payload={}, record_id=record_id)
+        validated_record_id = (
+            None if record_id is None else _validate_requested_record_id(record_id)
+        )
         descriptor = self.artifact_store.put_file(
             source,
             media_type=media_type,
             name=name,
             metadata={} if metadata is None else metadata,
         )
-        draft_data = {
+        draft_data: dict[str, Any] = {
             "record_type": RecordType.ARTIFACT,
             "payload": descriptor.model_dump(mode="python"),
         }
-        if record_id is not None:
-            draft_data["record_id"] = record_id
+        if validated_record_id is not None:
+            draft_data["record_id"] = validated_record_id
         record = self.create_record(RecordDraft.model_validate(draft_data), actor=actor)
         return record, descriptor
 
