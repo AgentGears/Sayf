@@ -19,6 +19,7 @@ from sayf.records import (
     RelationDraft,
     RelationType,
 )
+from sayf.state import STATE_EVENT_TYPES
 from sayf.storage import LedgerReadError, SQLiteEventStore
 
 app = typer.Typer(help="Sayf evidence-driven engineering control plane.")
@@ -26,15 +27,22 @@ ledger_app = typer.Typer(help="Inspect and mutate the append-only causal ledger.
 record_app = typer.Typer(help="Create and inspect immutable typed records.")
 relation_app = typer.Typer(help="Create immutable typed relations.")
 graph_app = typer.Typer(help="Traverse the deterministic typed-record graph.")
+state_app = typer.Typer(help="Qualify and inspect revision/staleness state.")
 artifact_app = typer.Typer(help="Register and verify content-addressed artifacts.")
 app.add_typer(ledger_app, name="ledger")
 app.add_typer(record_app, name="record")
 app.add_typer(relation_app, name="relation")
 app.add_typer(graph_app, name="graph")
+app.add_typer(state_app, name="state")
 app.add_typer(artifact_app, name="artifact")
 
 DEFAULT_DB = Path(".sayf/ledger.sqlite3")
 DEFAULT_OBJECTS = Path(".sayf/objects")
+_RESERVED_TYPED_EVENT_TYPES = {
+    RECORD_CREATED_EVENT_TYPE,
+    RELATION_CREATED_EVENT_TYPE,
+    *STATE_EVENT_TYPES,
+}
 
 
 def _reject_json_constant(value: str) -> None:
@@ -112,9 +120,9 @@ def append_event(
     payload: Annotated[str, typer.Option("--payload", help="JSON object payload.")] = "{}",
     db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
 ) -> None:
-    if event_type in {RECORD_CREATED_EVENT_TYPE, RELATION_CREATED_EVENT_TYPE}:
+    if event_type in _RESERVED_TYPED_EVENT_TYPES:
         raise typer.BadParameter(
-            "typed Sayf event types are reserved; use the record/relation commands"
+            "typed Sayf event types are reserved; use the typed/state commands"
         )
     payload_value = _parse_payload(payload)
     try:
@@ -286,6 +294,86 @@ def graph_path(
     except (LedgerReadError, GraphProjectionError, ValueError) as exc:
         _domain_error(exc)
     _echo_models(paths)
+
+
+@state_app.command("bind-dependency")
+def bind_dependency(
+    relation_id: Annotated[str, typer.Argument()],
+    actor_kind: Annotated[ActorKind, typer.Option("--actor-kind")] = ActorKind.HUMAN,
+    actor_id: Annotated[str, typer.Option("--actor-id")] = "local-user",
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        event = _repository(db, objects).bind_dependency(
+            relation_id,
+            actor=_actor(actor_kind, actor_id),
+        )
+    except (LedgerReadError, GraphProjectionError) as exc:
+        _domain_error(exc)
+    _echo_model(event)
+
+
+@state_app.command("invalidate")
+def invalidate_record(
+    relation_id: Annotated[str, typer.Argument()],
+    actor_kind: Annotated[ActorKind, typer.Option("--actor-kind")] = ActorKind.HUMAN,
+    actor_id: Annotated[str, typer.Option("--actor-id")] = "local-user",
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        event = _repository(db, objects).invalidate(
+            relation_id,
+            actor=_actor(actor_kind, actor_id),
+        )
+    except (LedgerReadError, GraphProjectionError) as exc:
+        _domain_error(exc)
+    _echo_model(event)
+
+
+@state_app.command("supersede")
+def supersede_record(
+    relation_id: Annotated[str, typer.Argument()],
+    actor_kind: Annotated[ActorKind, typer.Option("--actor-kind")] = ActorKind.HUMAN,
+    actor_id: Annotated[str, typer.Option("--actor-id")] = "local-user",
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        event = _repository(db, objects).supersede(
+            relation_id,
+            actor=_actor(actor_kind, actor_id),
+        )
+    except (LedgerReadError, GraphProjectionError) as exc:
+        _domain_error(exc)
+    _echo_model(event)
+
+
+@state_app.command("show")
+def show_effective_state(
+    record_id: Annotated[str, typer.Argument()],
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        state = _repository(db, objects).effective_state().state(record_id)
+    except (LedgerReadError, GraphProjectionError) as exc:
+        _domain_error(exc)
+    _echo_model(state)
+
+
+@state_app.command("affected")
+def show_affected_records(
+    record_id: Annotated[str, typer.Argument()],
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        states = _repository(db, objects).effective_state().affected(record_id)
+    except (LedgerReadError, GraphProjectionError) as exc:
+        _domain_error(exc)
+    _echo_models(states)
 
 
 @artifact_app.command("put")
