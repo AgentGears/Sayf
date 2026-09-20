@@ -130,6 +130,22 @@ Any concurrent append forces revalidation. A state transition is therefore never
 
 M0.3 semantic validation is also part of subsequent typed record/relation writes. A privileged low-level caller can still append a syntactically valid generic ledger event, but malformed reserved M0.3 state history blocks later semantic operations rather than being ignored.
 
+## Authorization and trust boundary
+
+The actor stored on a state-transition event is provenance, not an authorization credential. M0.3 does not add RBAC, policy evaluation, signatures, or a new permission subsystem.
+
+In the local-first milestone, permission to invoke `bind_dependency`, `invalidate`, or `supersede` comes from the host/application boundary that controls access to Sayf. An agent-authored relation remains an inert claim until a caller with that transition capability explicitly qualifies it. The mere presence of agent text or an agent-created relation does not acquire effective-state authority by itself.
+
+Policy-bound and evidence-bound authorization belongs to M0.4+. Adding an ad hoc M0.3 permission model would duplicate that future authority layer without solving the stronger arbitrary-database-writer trust boundary already documented by M0.1.
+
+## Performance boundary
+
+Effective-state projection is correctness-first. It reconstructs the fully verified ledger and typed graph, then derives staleness from the qualified dependency graph.
+
+For each invalidated or superseded root, current derivation may traverse the qualified dependency graph once. In the worst case this is proportional to the number of roots multiplied by graph size, in addition to the existing complete-history verification/replay cost. `CausalRepository` also validates M0.3 state before subsequent semantic reads/writes, so large histories will eventually require measured optimization.
+
+M0.3 intentionally does not add persistent mutable projections, caches, or incremental invalidation tables yet. Those should be introduced only after measurement establishes a forcing function and only as disposable, verifiable acceleration structures that cannot become a second authority store.
+
 ## Query surface
 
 M0.3 adds:
@@ -184,6 +200,8 @@ This is deliberately smaller than the eventual release-feedback scenario. It pro
 8. **Semantic snapshot freshness** — activation commits only against the exact state snapshot that was validated.
 9. **Malformed reserved state history fails closed** — subsequent semantic operations do not proceed through poisoned M0.3 history.
 10. **No mutable authority store** — all effective state remains a disposable projection of immutable ledger history.
+11. **Actor provenance is not authorization** — transition authority is supplied by the host boundary until policy-bound authority exists.
+12. **Optimization requires evidence** — replay/projection acceleration must not silently become another source of truth.
 
 ## Exit criteria
 
@@ -200,4 +218,5 @@ M0.3 is complete when:
 9. state activation rejects concurrent ledger-head changes after semantic validation;
 10. raw CLI append cannot impersonate reserved M0.3 state events;
 11. the A1 -> I1 -> invalidation -> staleness -> I2 acceptance slice passes end to end;
-12. all M0.1/M0.2 tests remain green on Ubuntu and Windows.
+12. all M0.1/M0.2 tests remain green on Ubuntu and Windows;
+13. authorization and performance boundaries are documented without introducing premature policy or projection infrastructure.
