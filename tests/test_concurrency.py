@@ -65,3 +65,34 @@ def test_contender_cannot_classify_in_progress_target_as_preexisting(tmp_path) -
     assert event.sequence == 1
     assert event.payload == {"index": 99}
     assert SQLiteEventStore(path).verify().valid is True
+
+
+def test_lexical_aliases_share_initialization_coordination(tmp_path) -> None:
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    canonical_path = tmp_path / "ledger.sqlite3"
+    alias_path = nested / ".." / "ledger.sqlite3"
+
+    owner = SQLiteEventStore(canonical_path)
+    contender = SQLiteEventStore(alias_path)
+    assert owner._initialization_lock_path == contender._initialization_lock_path
+
+    contender_started = Event()
+
+    def append_from_alias():
+        contender_started.set()
+        return contender.append(_draft(101))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with owner._initialization_guard():
+            future = executor.submit(append_from_alias)
+            assert contender_started.wait(timeout=1.0)
+
+            with pytest.raises(FutureTimeoutError):
+                future.result(timeout=0.1)
+
+        event = future.result(timeout=5.0)
+
+    assert event.sequence == 1
+    assert event.payload == {"index": 101}
+    assert owner.verify().valid is True
