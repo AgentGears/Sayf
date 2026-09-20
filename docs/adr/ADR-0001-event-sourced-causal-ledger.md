@@ -19,12 +19,13 @@ For the initial implementation:
 - stored timestamps and JSON documents use a canonical representation;
 - a versioned exact schema identifies a supported Sayf v1 ledger;
 - SQLite `quick_check` validates the local database container before authoritative use;
+- exact schema validation excludes only objects whose names begin with SQLite's literal reserved `sqlite_` prefix; lookalike user names such as `sqlitex` remain visible to validation;
 - database triggers reject event updates, deletes, and replacement-insert collisions during normal access;
 - first-use ownership is serialized **before the target ledger path is inspected** by an exclusive lock in a tiny non-authoritative SQLite coordination sidecar;
 - coordination filenames use a fixed-length SHA-256 key of the normalized, case-folded resolved target path so lexical/case aliases share the same initialization barrier conservatively;
 - recovery markers use a separate, stricter fixed-length target identity based on the resolved path with only operating-system-native path normalization, preventing a conservative coordination collision from authorizing recovery of a distinct case-sensitive target;
-- before reserving a missing target, the lock owner creates that small non-authoritative pending-initialization marker, which survives independently of the target's schema transaction;
-- after acquiring the barrier, the owner reserves the target path with exclusive file creation and creates the v1 schema inside a single SQLite transaction;
+- before reserving a missing target, the lock owner writes the recovery token to a same-directory staging file, flushes and fsyncs it, and atomically publishes the target-specific pending-initialization marker; target reservation occurs only after that publication succeeds;
+- after acquiring the barrier and publishing the marker, the owner reserves the target path with exclusive file creation and creates the v1 schema inside a single SQLite transaction;
 - an interrupted initialization is recoverable only when the target-specific marker exists and the target remains schema-less SQLite storage; arbitrary existing or user-schema-bearing databases remain fail-closed;
 - a stale pending marker beside an already valid Sayf ledger is cleared after the ledger passes normal validation;
 - a global unkeyed SHA-256 hash chain provides an internal chain-consistency check;
@@ -36,7 +37,7 @@ For the initial implementation:
 - larger immutable artifacts will use content-addressed filesystem storage in M0.2;
 - human-readable Markdown/JSON files are projections, not authoritative state.
 
-The coordination sidecar and pending marker contain no authoritative Sayf state. The sidecar exists only for cross-process first-use serialization. The marker records only that Sayf had begun creating one specific recovery identity under that barrier so a crash-interrupted schema-less target can be retried safely.
+The coordination sidecar and pending marker contain no authoritative Sayf state. The sidecar exists only for cross-process first-use serialization. The marker records only that Sayf had begun creating one specific recovery identity under that barrier so a crash-interrupted schema-less target can be retried safely. A partially written staging file is not a recovery authorization token; only the fully published final marker is recognized.
 
 ## Trust boundary
 
@@ -66,7 +67,9 @@ A graph database, distributed log, ORM, or event-streaming platform would add in
 - concurrent first-use ownership is decided before any contender classifies the target path;
 - case-insensitive path aliases conservatively share one first-use barrier;
 - conservative lock-key collisions cannot cross-authorize recovery of distinct case-sensitive targets;
-- a process/host interruption during first-use initialization can be retried when Sayf's target-specific pending marker proves the schema-less target came from an interrupted Sayf creation attempt;
+- the recovery token is fully published before target reservation, so a failed or interrupted staging write cannot create a partial final marker that legitimizes later recovery;
+- a process/host interruption after marker publication during first-use initialization can be retried when Sayf's target-specific pending marker proves the schema-less target came from an interrupted Sayf creation attempt;
+- schema lookalikes such as `sqlitex` cannot evade exact-schema or interrupted-recovery validation by matching a wildcard approximation of `sqlite_`;
 - supersession and invalidation can later be expressed without rewriting old semantic state;
 - adapters do not need an LLM to inspect authoritative history;
 - later projections can be rebuilt from source events;
@@ -121,6 +124,10 @@ Rejected because SQLite creates an `rwc` target before the first target transact
 ### One case-folded identity for both locking and recovery
 
 Rejected because conservative case folding is useful for serialization on case-insensitive filesystems but can collapse distinct target names on case-sensitive filesystems. Reusing that equivalence class for recovery would allow one target's pending marker to authorize a different schema-less target. Lock identity and recovery identity are therefore separate.
+
+### Direct in-place creation of the pending marker
+
+Rejected because an interruption during a direct write can leave a truncated or malformed final marker that wedges retry. The recovery token is staged in the same directory, flushed and fsynced, and then atomically renamed into its final path before the target ledger is reserved.
 
 ### Treating all empty SQLite files as interrupted initialization
 
