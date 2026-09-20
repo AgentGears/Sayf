@@ -43,6 +43,20 @@ CREATE INDEX IF NOT EXISTS idx_events_stream_sequence
     ON events(stream_id, sequence)
 """
 
+_INSERT_TRIGGER_SQL = f"""
+CREATE TRIGGER IF NOT EXISTS events_no_replace
+BEFORE INSERT ON events
+WHEN EXISTS (
+    SELECT 1 FROM events
+    WHERE sequence = NEW.sequence
+       OR event_id = NEW.event_id
+       OR event_hash = NEW.event_hash
+)
+BEGIN
+    SELECT RAISE(ABORT, '{_IMMUTABILITY_MESSAGE}');
+END
+"""
+
 _UPDATE_TRIGGER_SQL = f"""
 CREATE TRIGGER IF NOT EXISTS events_no_update
 BEFORE UPDATE ON events
@@ -67,6 +81,7 @@ VALUES ('schema_version', '{_LEDGER_SCHEMA_VERSION}');
 
 {_EVENTS_TABLE_SQL};
 {_STREAM_INDEX_SQL};
+{_INSERT_TRIGGER_SQL};
 {_UPDATE_TRIGGER_SQL};
 {_DELETE_TRIGGER_SQL};
 """
@@ -86,6 +101,7 @@ _EXPECTED_SCHEMA_OBJECTS = {
     ("table", "sayf_ledger_meta"): _normalize_schema_sql(_META_TABLE_SQL),
     ("table", "events"): _normalize_schema_sql(_EVENTS_TABLE_SQL),
     ("index", "idx_events_stream_sequence"): _normalize_schema_sql(_STREAM_INDEX_SQL),
+    ("trigger", "events_no_replace"): _normalize_schema_sql(_INSERT_TRIGGER_SQL),
     ("trigger", "events_no_update"): _normalize_schema_sql(_UPDATE_TRIGGER_SQL),
     ("trigger", "events_no_delete"): _normalize_schema_sql(_DELETE_TRIGGER_SQL),
 }
