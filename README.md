@@ -105,15 +105,19 @@ M0.2 keeps the M0.1 SQLite v1 schema unchanged. Typed records and relations are 
 
 A record or relation ID is exactly its creation event ID. The typed envelopes preserve creation actor, timestamp, ledger sequence, creating event ID, schema version, canonical content hash, and structured payload/metadata. Relations are directed, may form a multigraph, and can only reference records that already exist earlier in authoritative history; forward references and dangling edges fail closed.
 
-Normal raw CLI append refuses the reserved `sayf.record.created.v1` and `sayf.relation.created.v1` event names. If a privileged low-level caller nevertheless writes malformed reserved semantic history, M0.2 projection rejects it rather than treating malformed typed state as valid.
+Normal raw CLI append refuses the reserved `sayf.record.created.v1` and `sayf.relation.created.v1` event names. If a privileged low-level caller nevertheless writes malformed or currently unsupported reserved semantic history, M0.2 projection rejects it rather than treating malformed typed state as valid.
 
-Graph neighbor queries support outbound, inbound, and combined traversal. Relationship-path searches are explicit, cycle-safe, and bounded by depth, result count, and total neighbor expansion so a query cannot silently become unbounded work. Paths expose recorded relationships; they do not infer truth or causal certainty beyond those explicit edges.
+Typed writes validate one complete semantic snapshot and bind the eventual append to that snapshot's exact event count and head hash. The append re-verifies M0.1 history under `BEGIN IMMEDIATE`; if any event was committed after semantic validation, the typed write fails and must be revalidated rather than committing against stale semantics.
 
-Artifacts use SHA-256 content-addressed storage under `.sayf/objects/sha256/...`. Object bytes are verified against the digest, and an existing corrupt object at the expected address is rejected rather than silently overwritten. An object becomes referenced Sayf engineering state only when an immutable `Artifact` record binds its digest, byte length, metadata, actor, and creating event into the ledger. Unreferenced CAS bytes are not authoritative records.
+Graph neighbor queries support outbound, inbound, and combined traversal. Relationship-path searches are explicit, cycle-safe, and bounded by depth, result count, and total neighbor expansion. Exceeding a result or work bound fails the query rather than returning a partial path set that could be mistaken for complete causal coverage. Paths expose recorded relationships; they do not infer truth or causal certainty beyond those explicit edges.
 
-Except for the typed `Artifact` descriptor, M0.2 intentionally keeps individual record payloads as canonical JSON objects. Revision semantics, supersession effects, staleness propagation, evidence sufficiency, policy, and gates remain M0.3/M0.4 responsibilities.
+Artifacts use SHA-256 content-addressed storage under `.sayf/objects/sha256/...`. Object bytes are verified against the digest, and an existing or concurrently appearing corrupt object at the expected address is rejected rather than silently overwritten. POSIX publication uses a no-replace hard-link installation of the already-fsynced staging inode and therefore fails closed on a filesystem that cannot provide the required hard-link primitive; Windows uses a write-through no-replace move. This CAS publication requirement is separate from M0.1 ledger initialization, which remains hard-link-independent. An object becomes referenced Sayf engineering state only when an immutable `Artifact` record binds its digest, byte length, metadata, actor, and creating event into the ledger. Unreferenced CAS bytes are not authoritative records.
 
-M0.2 currently reconstructs the graph from the fully verified event history for each operation. This is a correctness-first O(N) replay/materialization tradeoff, not a high-throughput design. Future persistent projections or checkpoints may accelerate replay only if they remain verifiable and disposable rather than becoming another source of truth.
+Except for the typed `Artifact` descriptor, active M0.2 record payloads are canonical JSON objects. Names whose semantics would imply verification, policy/gate authority, release status, or runtime feedback are enumerated for the planned M0 vocabulary but are mechanically reserved until their later milestone contracts exist: `VerificationReceipt`, `RiskAssessment`, `PolicySnapshot`, `GateRequest`, `GateDecision`, `Release`, `RuntimeObservation`, and `FeedbackCase`. This prevents an immutable generic JSON object from acquiring apparent authority merely because it was given a future authoritative type name.
+
+Revision semantics, supersession effects, staleness propagation, evidence sufficiency, policy, and gates remain M0.3/M0.4 responsibilities.
+
+M0.2 currently reconstructs the graph from the fully verified event history for each operation. Typed writes then re-verify the ledger under the append transaction before comparing the semantic snapshot head. This is a correctness-first O(N) replay/verification tradeoff, not a high-throughput design. Future persistent projections or checkpoints may accelerate replay only if they remain verifiable and disposable rather than becoming another source of truth.
 
 See [`docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md`](docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md) for the frozen M0.2 contract and trust boundaries.
 
@@ -121,12 +125,14 @@ See [`docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md`](docs/architecture/M0_2_TYP
 
 1. **No silent mutation** — accepted historical state is superseded, never rewritten.
 2. **No missing provenance** — durable state identifies the actor and event that created it.
-3. **No unsupported authority** — an agent assertion is not authoritative merely because a model produced it.
-4. **No stale reuse** — authoritative decisions bind exact versions of their inputs.
+3. **No unsupported authority** — an agent assertion or future authority-looking type name is not authoritative merely because it was emitted.
+4. **No stale reuse** — authoritative decisions bind exact versions of their inputs; M0.2 typed writes bind the exact ledger head they semantically validated.
 5. **No hidden downstream impact** — invalidated premises must be traceable to affected decisions and releases.
 6. **Unknown is not pass** — missing evidence is not successful evidence.
 7. **Unknown storage is fail-closed** — existing authority stores are validated before authoritative read or mutation.
 8. **Derived graph state is disposable** — authoritative typed history remains in immutable ledger events.
+9. **Bounded queries are explicit** — relationship-path limits fail rather than silently presenting partial results as complete.
+10. **CAS publication is no-clobber** — an existing or racing digest address is verified/reused or rejected, never overwritten by normal publication.
 
 ## Development
 
