@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,9 +34,18 @@ def repository(tmp_path: Path) -> CausalRepository:
     )
 
 
-def create_record(repo: CausalRepository, record_id: str) -> None:
+def create_record(
+    repo: CausalRepository,
+    record_id: str,
+    *,
+    payload: dict | None = None,
+) -> None:
     repo.create_record(
-        RecordDraft(record_id=record_id, record_type=RecordType.CLAIM),
+        RecordDraft(
+            record_id=record_id,
+            record_type=RecordType.CLAIM,
+            payload={} if payload is None else payload,
+        ),
         actor=ACTOR,
     )
 
@@ -45,6 +55,8 @@ def create_relation(
     relation_id: str,
     source_id: str,
     target_id: str,
+    *,
+    metadata: dict | None = None,
 ) -> None:
     repo.create_relation(
         RelationDraft(
@@ -52,6 +64,7 @@ def create_relation(
             relation_type=RelationType.SUPPORTS,
             source_id=source_id,
             target_id=target_id,
+            metadata={} if metadata is None else metadata,
         ),
         actor=ACTOR,
     )
@@ -142,6 +155,93 @@ def test_path_result_bound_fails_instead_of_returning_partial_paths(tmp_path: Pa
         repo.graph().provenance_paths("a", "d", max_paths=1)
 
 
+def test_graph_results_cannot_mutate_projection_state(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    create_record(repo, "a", payload={"nested": {"items": ["original"]}})
+    create_record(repo, "b")
+    create_relation(
+        repo,
+        "rel_ab",
+        "a",
+        "b",
+        metadata={"nested": {"items": ["original"]}},
+    )
+    graph = repo.graph()
+
+    record = graph.record("a")
+    record.payload["nested"]["items"].append("mutated")
+    assert graph.record("a").payload == {"nested": {"items": ["original"]}}
+
+    listed_record = graph.records[0]
+    listed_record.payload["nested"]["items"].append("listed-mutation")
+    assert graph.record("a").payload == {"nested": {"items": ["original"]}}
+
+    relation = graph.relation("rel_ab")
+    relation.metadata["nested"]["items"].append("mutated")
+    assert graph.relation("rel_ab").metadata == {"nested": {"items": ["original"]}}
+
+    neighbor = graph.neighbors("a")[0]
+    neighbor.relation.metadata["nested"]["items"].append("neighbor-mutation")
+    assert graph.relation("rel_ab").metadata == {"nested": {"items": ["original"]}}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX CAS publication regression")
+def test_posix_existing_check_reverifies_target_that_appears_after_missing_result(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = ContentAddressedArtifactStore(tmp_path / "objects")
+    content = b"concurrent-identical-artifact"
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+    target = store.path_for(digest)
+    original_verify = store._verify_path
+    injected = False
+
+    def verify_then_publish(path: Path, expected_digest: str):
+        nonlocal injected
+        result = original_verify(path, expected_digest)
+        if not injected and path == target and not result.valid:
+            injected = True
+            path.write_bytes(content)
+        return result
+
+    monkeypatch.setattr(store, "_verify_path", verify_then_publish)
+
+    descriptor = store.put_bytes(content)
+
+    assert descriptor.digest == digest
+    assert descriptor.size_bytes == len(content)
+    assert target.read_bytes() == content
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX CAS directory durability regression")
+def test_posix_cas_durably_anchors_new_directory_entries(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "new-parent" / "objects"
+    store = ContentAddressedArtifactStore(root)
+    synced: list[Path] = []
+
+    def record_sync(path: Path) -> None:
+        synced.append(Path(path))
+
+    monkeypatch.setattr(
+        ContentAddressedArtifactStore,
+        "_fsync_directory",
+        staticmethod(record_sync),
+    )
+
+    descriptor = store.put_bytes(b"durable-artifact")
+    target = store.path_for(descriptor.digest)
+
+    assert tmp_path in synced
+    assert root.parent in synced
+    assert root in synced
+    assert root / "sha256" in synced
+    assert target.parent in synced
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX no-clobber CAS publication regression")
 def test_posix_cas_race_never_overwrites_object_that_appears_before_publish(
     tmp_path: Path,
@@ -149,7 +249,7 @@ def test_posix_cas_race_never_overwrites_object_that_appears_before_publish(
 ) -> None:
     store = ContentAddressedArtifactStore(tmp_path / "objects")
     content = b"expected immutable artifact"
-    digest = "sha256:" + __import__("hashlib").sha256(content).hexdigest()
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
     target = store.path_for(digest)
 
     def racing_link(source, destination, *, follow_symlinks=False):
