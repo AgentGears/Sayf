@@ -220,6 +220,7 @@ def test_pending_marker_does_not_treat_sqlitex_as_sqlite_owned(tmp_path) -> None
             for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
+        }
     assert names == {"sqlitex"}
 
 
