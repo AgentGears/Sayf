@@ -36,7 +36,7 @@ def test_initialize_does_not_convert_preexisting_empty_sqlite_database(tmp_path)
         user_objects = connection.execute(
             """
             SELECT name FROM sqlite_master
-            WHERE name NOT LIKE 'sqlite_%'
+            WHERE lower(name) NOT GLOB 'sqlite_*'
               AND type IN ('table', 'index', 'trigger', 'view')
             """
         ).fetchall()
@@ -127,7 +127,7 @@ def test_pending_marker_cannot_cross_authorize_case_variant_target(tmp_path) -> 
         user_objects = connection.execute(
             """
             SELECT name FROM sqlite_master
-            WHERE name NOT LIKE 'sqlite_%'
+            WHERE lower(name) NOT GLOB 'sqlite_*'
               AND type IN ('table', 'index', 'trigger', 'view')
             """
         ).fetchall()
@@ -181,6 +181,70 @@ def test_pending_marker_does_not_legitimize_unknown_schema(tmp_path) -> None:
             ).fetchall()
         }
     assert names == {"unrelated"}
+
+
+def test_verify_rejects_user_table_named_sqlitex(tmp_path) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    store.initialize()
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE sqlitex (id INTEGER PRIMARY KEY)")
+        connection.commit()
+
+    result = store.verify()
+
+    assert result.valid is False
+    assert result.reason == "Sayf ledger schema objects are unexpected or incomplete"
+
+
+def test_pending_marker_does_not_treat_sqlitex_as_sqlite_owned(tmp_path) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+
+    with store._initialization_guard():
+        store._ensure_pending_initialization_marker()
+        with sqlite3.connect(path) as connection:
+            connection.execute("CREATE TABLE sqlitex (id INTEGER PRIMARY KEY)")
+            connection.commit()
+
+    with pytest.raises(
+        LedgerReadError,
+        match="interrupted initialization target contains user schema objects",
+    ):
+        store.initialize()
+
+    with sqlite3.connect(path) as connection:
+        names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+    assert names == {"sqlitex"}
+
+
+def test_pending_marker_publish_failure_leaves_no_final_marker_or_target(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    marker_path = store._initialization_pending_path
+
+    def fail_replace(source, destination):
+        raise OSError("forced marker publish failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(
+        LedgerReadError,
+        match="unable to create initialization pending marker",
+    ):
+        store.initialize()
+
+    assert not path.exists()
+    assert not marker_path.exists()
+    assert list(tmp_path.glob(f".{marker_path.name}.*.tmp")) == []
 
 
 def test_stale_pending_marker_is_cleared_after_valid_commit(tmp_path) -> None:
