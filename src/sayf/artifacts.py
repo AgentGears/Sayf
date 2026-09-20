@@ -59,7 +59,7 @@ class ContentAddressedArtifactStore:
 
     @classmethod
     def _ensure_directory_durable(cls, path: Path) -> None:
-        """Create a directory chain and durably anchor each new POSIX entry."""
+        """Create a directory chain and durably anchor each POSIX boundary."""
         if os.name == "nt":
             path.mkdir(parents=True, exist_ok=True)
             if not path.is_dir():
@@ -77,6 +77,13 @@ class ContentAddressedArtifactStore:
 
         if not current.is_dir():
             raise NotADirectoryError(current)
+
+        # The first existing directory may itself have been created concurrently.
+        # Sync both it and its parent before relying on its name as the durable
+        # boundary beneath which new CAS directories and objects will be published.
+        cls._fsync_directory(current)
+        if current.parent != current:
+            cls._fsync_directory(current.parent)
 
         for directory in reversed(missing):
             try:
