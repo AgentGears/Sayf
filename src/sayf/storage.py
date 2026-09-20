@@ -160,6 +160,20 @@ class SQLiteEventStore:
             f".sayf-init-recovery-{self._initialization_recovery_key}.pending"
         )
 
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        if os.name == "nt":
+            return
+
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        directory_fd = os.open(path, flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
     @contextmanager
     def _connect(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
         mode = "ro" if read_only else "rw"
@@ -256,6 +270,7 @@ class SQLiteEventStore:
                 return False
 
             os.replace(staging_path, marker_path)
+            self._fsync_directory(marker_path.parent)
             staging_path = None
             return True
         except OSError as exc:
@@ -301,8 +316,13 @@ class SQLiteEventStore:
 
         try:
             with self._connect(read_only=True) as connection:
-                self._validate_database(connection)
-                yield connection
+                connection.execute("BEGIN")
+                try:
+                    self._validate_database(connection)
+                    yield connection
+                finally:
+                    if connection.in_transaction:
+                        connection.execute("ROLLBACK")
         except LedgerReadError:
             raise
         except sqlite3.Error as exc:
