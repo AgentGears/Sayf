@@ -151,10 +151,12 @@ Only a qualified `depends_on` edge participates in staleness propagation. A qual
 Effective state exposes three independent axes rather than one overloaded status:
 
 ```text
-validity:   valid | invalidated
+validity:   not_invalidated | invalidated
 revision:   current | superseded
 freshness:  fresh | stale
 ```
+
+The labels deliberately stop short of positive authority claims. `not_invalidated` means only that no qualified invalidation exists; `current` means only that no qualified supersession exists; and `fresh` means only that no qualified dependency path currently reaches an invalidated or superseded root. They do not mean true, accepted, verified, complete, safe, or pass.
 
 Invalidated and superseded records are staleness roots. Their qualified transitive dependents become stale. Each stale record carries a deterministic canonical dependency path back to each root so the reason for staleness remains mechanically inspectable.
 
@@ -175,7 +177,7 @@ See [`docs/architecture/M0_3_REVISION_STALENESS.md`](docs/architecture/M0_3_REVI
 3. **No unsupported authority** — an agent assertion or relation label is not authoritative merely because it was emitted.
 4. **No stale reuse** — typed/state writes bind the exact ledger head whose semantics they validated.
 5. **No hidden downstream impact** — invalidated or superseded premises expose qualified stale dependents and canonical dependency paths.
-6. **Unknown is not pass** — missing evidence is not successful evidence.
+6. **Unknown is not pass** — absence of invalidation, supersession, or staleness is not promoted into truth, acceptance, verification, or pass.
 7. **Unknown storage is fail-closed** — existing authority stores are validated before authoritative read or mutation.
 8. **Derived semantic state is disposable** — authoritative history remains in immutable ledger events.
 9. **Bounded queries are explicit** — relationship-path limits fail rather than silently presenting partial results as complete.
