@@ -140,6 +140,12 @@ class SQLiteEventStore:
         return hashlib.sha256(os.fsencode(normalized_target)).hexdigest()
 
     @property
+    def _initialization_recovery_key(self) -> str:
+        target = self.path.resolve(strict=False)
+        normalized_target = os.path.normcase(str(target))
+        return hashlib.sha256(os.fsencode(normalized_target)).hexdigest()
+
+    @property
     def _initialization_lock_path(self) -> Path:
         target = self.path.resolve(strict=False)
         return target.parent / (
@@ -150,7 +156,7 @@ class SQLiteEventStore:
     def _initialization_pending_path(self) -> Path:
         target = self.path.resolve(strict=False)
         return target.parent / (
-            f".sayf-init-{self._initialization_coordination_key}.pending"
+            f".sayf-init-recovery-{self._initialization_recovery_key}.pending"
         )
 
     @contextmanager
