@@ -230,6 +230,16 @@ class SQLiteEventStore:
                     if not verification.valid:
                         raise LedgerReadError(self._verification_error(verification))
 
+                    duplicate_event_id = connection.execute(
+                        "SELECT 1 FROM events WHERE event_id = ?",
+                        (snapshot.event_id,),
+                    ).fetchone()
+                    if duplicate_event_id is not None:
+                        raise LedgerReadError(
+                            "unable to append to ledger: "
+                            "UNIQUE constraint failed: events.event_id"
+                        )
+
                     sequence = verification.checked_events + 1
                     event_hash = compute_event_hash(
                         snapshot,
