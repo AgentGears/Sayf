@@ -14,7 +14,7 @@ from sayf.records import (
     RelationType,
     relation_event_payload,
 )
-from sayf.state import DEPENDENCY_BOUND_EVENT_TYPE, StateProjectionError
+from sayf.state import DEPENDENCY_BOUND_EVENT_TYPE, FreshnessState, StateProjectionError
 
 ACTOR = Actor(kind=ActorKind.HUMAN, id="m03-edge-test")
 
@@ -127,3 +127,39 @@ def test_multiple_invalidation_causes_preserve_activation_order(tmp_path: Path) 
     state = repo.effective_state().state("a1")
     assert state.invalidated_by_record_ids == ("o2", "o1")
     assert state.invalidation_relation_ids == ("inv_o2", "inv_o1")
+
+
+def test_dependency_cycle_does_not_mark_root_stale_from_itself(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    record(repo, "a", RecordType.ASSUMPTION)
+    record(repo, "b", RecordType.CLAIM)
+    record(repo, "o", RecordType.OBSERVATION)
+    relation(repo, "dep_a_b", RelationType.DEPENDS_ON, "a", "b")
+    relation(repo, "dep_b_a", RelationType.DEPENDS_ON, "b", "a")
+    relation(repo, "inv_o_a", RelationType.INVALIDATES, "o", "a")
+
+    repo.bind_dependency("dep_a_b", actor=ACTOR)
+    repo.bind_dependency("dep_b_a", actor=ACTOR)
+    repo.invalidate("inv_o_a", actor=ACTOR)
+
+    state = repo.effective_state()
+    assert state.state("a").freshness is FreshnessState.FRESH
+    assert state.state("b").freshness is FreshnessState.STALE
+    assert [item.record_id for item in state.affected("a")] == ["b"]
+
+
+def test_dependency_bound_after_invalidation_becomes_stale_immediately(
+    tmp_path: Path,
+) -> None:
+    repo = repository(tmp_path)
+    record(repo, "a1", RecordType.ASSUMPTION)
+    record(repo, "i1", RecordType.INTENT_REVISION)
+    record(repo, "o1", RecordType.OBSERVATION)
+    relation(repo, "dep_i1_a1", RelationType.DEPENDS_ON, "i1", "a1")
+    relation(repo, "inv_o1_a1", RelationType.INVALIDATES, "o1", "a1")
+
+    repo.invalidate("inv_o1_a1", actor=ACTOR)
+    assert repo.effective_state().state("i1").freshness is FreshnessState.FRESH
+
+    repo.bind_dependency("dep_i1_a1", actor=ACTOR)
+    assert repo.effective_state().state("i1").freshness is FreshnessState.STALE
