@@ -4,7 +4,7 @@ from collections import defaultdict, deque
 from collections.abc import Iterable
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from sayf.domain import LedgerEvent
 from sayf.records import (
@@ -58,7 +58,7 @@ class GraphPath(BaseModel):
 
 
 class CausalGraph:
-    """Deterministic in-memory projection of typed Sayf record/relation events."""
+    """Deterministic in-memory projection of complete authoritative Sayf history."""
 
     def __init__(
         self,
@@ -79,13 +79,14 @@ class CausalGraph:
         outgoing_lists: dict[str, list[str]] = defaultdict(list)
         incoming_lists: dict[str, list[str]] = defaultdict(list)
 
-        last_sequence = 0
+        expected_sequence = 1
         for event in events:
-            if event.sequence <= last_sequence:
+            if event.sequence != expected_sequence:
                 raise GraphProjectionError(
-                    "typed projection requires events in strictly increasing ledger sequence"
+                    "typed projection requires complete contiguous ledger history: "
+                    f"expected sequence {expected_sequence}, found {event.sequence}"
                 )
-            last_sequence = event.sequence
+            expected_sequence += 1
 
             try:
                 if event.event_type == RECORD_CREATED_EVENT_TYPE:
