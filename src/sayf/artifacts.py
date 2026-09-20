@@ -181,6 +181,10 @@ class ContentAddressedArtifactStore:
                 f"refusing to replace invalid existing artifact object {digest}: "
                 f"{concurrent.reason}"
             )
+        # A valid target may have become visible after another POSIX publisher's
+        # hard-link installation but before that publisher durably synced the shard.
+        # Anchor the directory entry ourselves before allowing ledger registration.
+        self._fsync_directory(target.parent)
         staging_path.unlink(missing_ok=True)
         return concurrent.size_bytes or 0
 
