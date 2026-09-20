@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 
 from sayf import cli as cli_module
 from sayf.cli import _parse_payload, app
-from sayf.storage import SQLiteEventStore
+from sayf.storage import LedgerReadError, SQLiteEventStore
 
 runner = CliRunner()
 
@@ -91,3 +91,42 @@ def test_cli_converts_json_recursion_without_traceback(tmp_path, monkeypatch) ->
     assert result.exit_code == 2
     assert "Traceback" not in result.output
     assert db.exists() is False
+
+
+def test_metadata_validation_does_not_materialize_all_rows(tmp_path) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    store.initialize()
+
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            "INSERT INTO sayf_ledger_meta (key, value) VALUES ('extra', 'unexpected')"
+        )
+        connection.commit()
+
+        class MetadataCursorProxy:
+            def __init__(self, cursor: sqlite3.Cursor) -> None:
+                self.cursor = cursor
+
+            def fetchone(self):
+                return self.cursor.fetchone()
+
+            def fetchall(self):
+                raise AssertionError("metadata validation must not materialize all rows")
+
+        class ConnectionProxy:
+            def __init__(self, wrapped: sqlite3.Connection) -> None:
+                self.wrapped = wrapped
+
+            def execute(self, sql: str, parameters=()):
+                cursor = self.wrapped.execute(sql, parameters)
+                if "FROM sayf_ledger_meta ORDER BY key" in sql:
+                    return MetadataCursorProxy(cursor)
+                return cursor
+
+        with pytest.raises(
+            LedgerReadError,
+            match="Sayf ledger metadata is unsupported or malformed",
+        ):
+            SQLiteEventStore._validate_schema(ConnectionProxy(connection))
