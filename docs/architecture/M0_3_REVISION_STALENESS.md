@@ -94,11 +94,12 @@ M0.3 commits narrowly to linear revision lineages:
 
 - source and target must be different records;
 - source and target must have the same `RecordType`;
+- the superseding source record must have been created later in ledger history than the superseded target record;
 - one old record may have only one direct superseder;
 - one new record may directly supersede only one old record;
 - a record already superseded earlier in history cannot later become the source of a new supersession transition.
 
-These rules keep the effective revision tip deterministic. Branch/merge revision semantics are deferred until a concrete use case requires them.
+These rules keep the effective revision tip deterministic and ensure revision direction cannot run backward through immutable creation time. Reinstating older content therefore requires creating a new record carrying that content rather than making an older record supersede a newer one. Branch/merge revision semantics are deferred until a concrete use case requires them.
 
 ### Freshness
 
@@ -202,7 +203,7 @@ This is deliberately smaller than the eventual release-feedback scenario. It pro
 4. **Independent state axes with claim ceilings** — absence of invalidation, supersession, or stale dependencies is not promoted into truth, acceptance, verification, or pass.
 5. **Only qualified dependencies propagate staleness** — generic graph adjacency is not silently treated as authority.
 6. **Deterministic propagation** — the same verified history yields the same affected set and canonical stale-cause paths.
-7. **Linear supersession for M0.3** — ambiguous branching/merge revision lineages fail closed rather than being guessed.
+7. **Forward linear supersession for M0.3** — revision edges must move from a later-created same-type record to an earlier-created record; ambiguous branching/merge lineages fail closed rather than being guessed.
 8. **Semantic snapshot freshness** — activation commits only against the exact state snapshot that was validated.
 9. **Malformed reserved state history fails closed** — subsequent semantic operations do not proceed through poisoned M0.3 history.
 10. **No mutable authority store** — all effective state remains a disposable projection of immutable ledger history.
@@ -217,7 +218,7 @@ M0.3 is complete when:
 2. qualification events bind an earlier relation ID and exact content hash;
 3. invalidation preserves direct cause/relation/event provenance without claiming positive validity before invalidation;
 4. supersession preserves direct superseder/relation/event provenance;
-5. same-type linear supersession is enforced deterministically;
+5. same-type supersession is linear, moves forward in record-creation chronology, and rejects branching/non-current sources;
 6. invalidated and superseded roots make qualified transitive dependents stale;
 7. affected records carry a deterministic dependency path back to the stale root;
 8. malformed, duplicate, mismatched, self-loop, or forward-referencing state activations fail closed;
