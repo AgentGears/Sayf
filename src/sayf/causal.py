@@ -3,9 +3,22 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel
+
 from sayf.artifacts import ArtifactVerification, ContentAddressedArtifactStore
 from sayf.domain import Actor, EventDraft, LedgerEvent
+from sayf.gates import (
+    GateDecisionStatus,
+    GateProjection,
+    GateRequestSpec,
+    PolicySnapshotSpec,
+    VerificationReceiptSpec,
+    build_gate_request_payload,
+    build_policy_snapshot_payload,
+    build_verification_receipt_payload,
+)
 from sayf.graph import CausalGraph, GraphProjectionError
+from sayf.ids import new_id
 from sayf.records import (
     RECORD_CREATED_EVENT_TYPE,
     RELATION_CREATED_EVENT_TYPE,
@@ -19,6 +32,7 @@ from sayf.records import (
     record_from_event,
     relation_event_payload,
     relation_from_event,
+    semantic_record_event_payload,
 )
 from sayf.semantic_append import append_if_ledger_head
 from sayf.state import (
@@ -65,24 +79,35 @@ class CausalRepository:
 
     def _semantic_snapshot(
         self,
-    ) -> tuple[CausalGraph, EffectiveStateProjection, int, str | None]:
+    ) -> tuple[
+        CausalGraph,
+        EffectiveStateProjection,
+        GateProjection,
+        int,
+        str | None,
+    ]:
         events = self.event_store.events()
-        state = EffectiveStateProjection.from_events(events)
-        graph = state.graph
+        gates = GateProjection.from_events(events)
+        state = gates.state_projection
+        graph = gates.graph
         head_hash = events[-1].event_hash if events else None
-        return graph, state, len(events), head_hash
+        return graph, state, gates, len(events), head_hash
 
     def _graph_snapshot(self) -> tuple[CausalGraph, int, str | None]:
-        graph, _, event_count, head_hash = self._semantic_snapshot()
+        graph, _, _, event_count, head_hash = self._semantic_snapshot()
         return graph, event_count, head_hash
 
     def graph(self) -> CausalGraph:
-        graph, _, _, _ = self._semantic_snapshot()
+        graph, _, _, _, _ = self._semantic_snapshot()
         return graph
 
     def effective_state(self) -> EffectiveStateProjection:
-        _, state, _, _ = self._semantic_snapshot()
+        _, state, _, _, _ = self._semantic_snapshot()
         return state
+
+    def gates(self) -> GateProjection:
+        _, _, gates, _, _ = self._semantic_snapshot()
+        return gates
 
     def create_record(self, draft: RecordDraft, *, actor: Actor) -> Record:
         snapshot = RecordDraft.model_validate(draft.model_dump(mode="python"))
@@ -108,6 +133,129 @@ class CausalRepository:
             expected_head_hash=expected_head_hash,
         )
         return record_from_event(event)
+
+    def _append_semantic_record(
+        self,
+        record_type: RecordType,
+        payload: BaseModel,
+        *,
+        actor: Actor,
+        record_id: str | None,
+        graph: CausalGraph,
+        expected_event_count: int,
+        expected_head_hash: str | None,
+    ) -> Record:
+        semantic_record_id = (
+            new_id("rec")
+            if record_id is None
+            else _validate_requested_record_id(record_id)
+        )
+        try:
+            graph.record(semantic_record_id)
+        except GraphProjectionError:
+            pass
+        else:
+            raise LedgerReadError(f"record id already exists: {semantic_record_id}")
+
+        event = append_if_ledger_head(
+            self.event_store,
+            EventDraft(
+                event_id=semantic_record_id,
+                stream_id=f"record:{semantic_record_id}",
+                event_type=RECORD_CREATED_EVENT_TYPE,
+                actor=actor,
+                payload=semantic_record_event_payload(record_type, payload),
+            ),
+            expected_event_count=expected_event_count,
+            expected_head_hash=expected_head_hash,
+        )
+        return record_from_event(event)
+
+    def record_verification(
+        self,
+        spec: VerificationReceiptSpec,
+        *,
+        actor: Actor,
+        record_id: str | None = None,
+    ) -> Record:
+        snapshot = VerificationReceiptSpec.model_validate(spec.model_dump(mode="python"))
+        self.event_store.initialize()
+        graph, _, _, expected_event_count, expected_head_hash = self._semantic_snapshot()
+        payload = build_verification_receipt_payload(graph, snapshot)
+        return self._append_semantic_record(
+            RecordType.VERIFICATION_RECEIPT,
+            payload,
+            actor=actor,
+            record_id=record_id,
+            graph=graph,
+            expected_event_count=expected_event_count,
+            expected_head_hash=expected_head_hash,
+        )
+
+    def register_policy_snapshot(
+        self,
+        spec: PolicySnapshotSpec,
+        *,
+        actor: Actor,
+        record_id: str | None = None,
+    ) -> Record:
+        snapshot = PolicySnapshotSpec.model_validate(spec.model_dump(mode="python"))
+        self.event_store.initialize()
+        graph, _, _, expected_event_count, expected_head_hash = self._semantic_snapshot()
+        payload = build_policy_snapshot_payload(snapshot)
+        return self._append_semantic_record(
+            RecordType.POLICY_SNAPSHOT,
+            payload,
+            actor=actor,
+            record_id=record_id,
+            graph=graph,
+            expected_event_count=expected_event_count,
+            expected_head_hash=expected_head_hash,
+        )
+
+    def request_gate(
+        self,
+        spec: GateRequestSpec,
+        *,
+        actor: Actor,
+        record_id: str | None = None,
+    ) -> Record:
+        snapshot = GateRequestSpec.model_validate(spec.model_dump(mode="python"))
+        self.event_store.initialize()
+        graph, _, _, expected_event_count, expected_head_hash = self._semantic_snapshot()
+        payload = build_gate_request_payload(graph, snapshot)
+        return self._append_semantic_record(
+            RecordType.GATE_REQUEST,
+            payload,
+            actor=actor,
+            record_id=record_id,
+            graph=graph,
+            expected_event_count=expected_event_count,
+            expected_head_hash=expected_head_hash,
+        )
+
+    def evaluate_gate(
+        self,
+        request_id: str,
+        *,
+        actor: Actor,
+        record_id: str | None = None,
+    ) -> Record:
+        self.event_store.initialize()
+        graph, _, gates, expected_event_count, expected_head_hash = self._semantic_snapshot()
+        payload = gates.evaluate_request(request_id)
+        return self._append_semantic_record(
+            RecordType.GATE_DECISION,
+            payload,
+            actor=actor,
+            record_id=record_id,
+            graph=graph,
+            expected_event_count=expected_event_count,
+            expected_head_hash=expected_head_hash,
+        )
+
+    def gate_status(self, decision_id: str) -> GateDecisionStatus:
+        return self.gates().status(decision_id)
 
     def create_relation(self, draft: RelationDraft, *, actor: Actor) -> Relation:
         snapshot = RelationDraft.model_validate(draft.model_dump(mode="python"))
@@ -144,7 +292,7 @@ class CausalRepository:
         actor: Actor,
     ) -> LedgerEvent:
         self.event_store.initialize()
-        _, state, expected_event_count, expected_head_hash = self._semantic_snapshot()
+        _, state, _, expected_event_count, expected_head_hash = self._semantic_snapshot()
 
         if event_type == DEPENDENCY_BOUND_EVENT_TYPE:
             relation = state.validate_dependency_binding(relation_id)
