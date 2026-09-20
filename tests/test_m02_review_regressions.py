@@ -269,6 +269,43 @@ def test_posix_cas_anchors_existing_concurrent_directory_boundary(
     assert tmp_path in synced
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX CAS reuse durability regression")
+def test_posix_cas_reuse_fsyncs_target_directory_after_collision(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = ContentAddressedArtifactStore(tmp_path / "objects")
+    content = b"concurrent-valid-object"
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+    target = store.path_for(digest)
+    original_link = artifacts_module.os.link
+    collision_seen = False
+    synced_after_collision: list[Path] = []
+
+    def racing_link(source, destination, *, follow_symlinks=False):
+        nonlocal collision_seen
+        original_link(source, destination, follow_symlinks=follow_symlinks)
+        collision_seen = True
+        raise FileExistsError("simulated publisher visible before directory fsync")
+
+    def record_sync(path: Path) -> None:
+        if collision_seen:
+            synced_after_collision.append(Path(path))
+
+    monkeypatch.setattr(
+        ContentAddressedArtifactStore,
+        "_fsync_directory",
+        staticmethod(record_sync),
+    )
+    monkeypatch.setattr(artifacts_module.os, "link", racing_link)
+
+    descriptor = store.put_bytes(content)
+
+    assert descriptor.digest == digest
+    assert target.parent in synced_after_collision
+    assert target.read_bytes() == content
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX no-clobber CAS publication regression")
 def test_posix_cas_race_never_overwrites_object_that_appears_before_publish(
     tmp_path: Path,
