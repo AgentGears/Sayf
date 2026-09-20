@@ -67,10 +67,21 @@ class CausalGraph:
         outgoing: dict[str, tuple[str, ...]],
         incoming: dict[str, tuple[str, ...]],
     ) -> None:
-        self._records = records
-        self._relations = relations
-        self._outgoing = outgoing
-        self._incoming = incoming
+        # Pydantic's frozen models are only shallowly frozen. Keep private deep copies
+        # so nested JSON values supplied by a constructor caller cannot mutate the
+        # projection after construction.
+        self._records = {key: value.model_copy(deep=True) for key, value in records.items()}
+        self._relations = {key: value.model_copy(deep=True) for key, value in relations.items()}
+        self._outgoing = dict(outgoing)
+        self._incoming = dict(incoming)
+
+    @staticmethod
+    def _copy_record(record: Record) -> Record:
+        return record.model_copy(deep=True)
+
+    @staticmethod
+    def _copy_relation(relation: Relation) -> Relation:
+        return relation.model_copy(deep=True)
 
     @classmethod
     def from_events(cls, events: Iterable[LedgerEvent]) -> CausalGraph:
@@ -137,28 +148,29 @@ class CausalGraph:
 
     @property
     def records(self) -> tuple[Record, ...]:
-        return tuple(
-            sorted(
-                self._records.values(),
-                key=lambda item: (item.created_sequence, item.id),
-            )
+        ordered = sorted(
+            self._records.values(),
+            key=lambda item: (item.created_sequence, item.id),
         )
+        return tuple(self._copy_record(record) for record in ordered)
 
     @property
     def relations(self) -> tuple[Relation, ...]:
-        return tuple(
-            sorted(self._relations.values(), key=lambda item: (item.created_sequence, item.id))
+        ordered = sorted(
+            self._relations.values(),
+            key=lambda item: (item.created_sequence, item.id),
         )
+        return tuple(self._copy_relation(relation) for relation in ordered)
 
     def record(self, record_id: str) -> Record:
         try:
-            return self._records[record_id]
+            return self._copy_record(self._records[record_id])
         except KeyError as exc:
             raise GraphProjectionError(f"unknown record id {record_id}") from exc
 
     def relation(self, relation_id: str) -> Relation:
         try:
-            return self._relations[relation_id]
+            return self._copy_relation(self._relations[relation_id])
         except KeyError as exc:
             raise GraphProjectionError(f"unknown relation id {relation_id}") from exc
 
@@ -169,7 +181,8 @@ class CausalGraph:
         direction: GraphDirection = GraphDirection.OUTBOUND,
         relation_types: set[RelationType] | None = None,
     ) -> tuple[GraphNeighbor, ...]:
-        self.record(record_id)
+        if record_id not in self._records:
+            raise GraphProjectionError(f"unknown record id {record_id}")
         result: list[GraphNeighbor] = []
 
         if direction in (GraphDirection.OUTBOUND, GraphDirection.BOTH):
@@ -179,8 +192,8 @@ class CausalGraph:
                     continue
                 result.append(
                     GraphNeighbor(
-                        record=self._records[relation.target_id],
-                        relation=relation,
+                        record=self._copy_record(self._records[relation.target_id]),
+                        relation=self._copy_relation(relation),
                         direction=GraphDirection.OUTBOUND,
                     )
                 )
@@ -195,8 +208,8 @@ class CausalGraph:
                         continue
                 result.append(
                     GraphNeighbor(
-                        record=self._records[relation.source_id],
-                        relation=relation,
+                        record=self._copy_record(self._records[relation.source_id]),
+                        relation=self._copy_relation(relation),
                         direction=GraphDirection.INBOUND,
                     )
                 )
@@ -230,8 +243,10 @@ class CausalGraph:
         if not 1 <= max_expansions <= 100_000:
             raise ValueError("max_expansions must be between 1 and 100000")
 
-        self.record(start_id)
-        self.record(end_id)
+        if start_id not in self._records:
+            raise GraphProjectionError(f"unknown record id {start_id}")
+        if end_id not in self._records:
+            raise GraphProjectionError(f"unknown record id {end_id}")
         if start_id == end_id:
             return (GraphPath(start_id=start_id, end_id=end_id, steps=()),)
         if max_depth == 0:
