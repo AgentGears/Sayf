@@ -251,6 +251,12 @@ class SQLiteEventStore:
     def _ensure_pending_initialization_marker(self) -> bool:
         marker_path = self._initialization_pending_path
         if self._pending_initialization_exists():
+            try:
+                self._fsync_directory(marker_path.parent)
+            except OSError as exc:
+                raise LedgerReadError(
+                    f"unable to establish initialization pending marker durability: {exc}"
+                ) from exc
             return False
 
         staging_path: Path | None = None
@@ -267,12 +273,15 @@ class SQLiteEventStore:
                 os.fsync(marker.fileno())
 
             if self._pending_initialization_exists():
+                self._fsync_directory(marker_path.parent)
                 return False
 
             os.replace(staging_path, marker_path)
             self._fsync_directory(marker_path.parent)
             staging_path = None
             return True
+        except LedgerReadError:
+            raise
         except OSError as exc:
             raise LedgerReadError(
                 f"unable to create initialization pending marker: {exc}"
@@ -343,15 +352,14 @@ class SQLiteEventStore:
                     except LedgerReadError:
                         if not pending:
                             raise
+                        self._ensure_pending_initialization_marker()
                         self._validate_recoverable_pending_target()
                     else:
                         if pending:
                             self._clear_pending_initialization_marker()
                         return
                 else:
-                    marker_created_here = False
-                    if not pending:
-                        marker_created_here = self._ensure_pending_initialization_marker()
+                    marker_created_here = self._ensure_pending_initialization_marker()
 
                     try:
                         with self.path.open("xb"):
