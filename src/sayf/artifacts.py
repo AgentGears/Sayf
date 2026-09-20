@@ -135,6 +135,16 @@ class ContentAddressedArtifactStore:
         digest = self._validated_digest(digest)
         return self._verify_path(self.path_for(digest), digest)
 
+    def _reuse_concurrent_target(self, staging_path: Path, target: Path, digest: str) -> int:
+        concurrent = self._verify_path(target, digest)
+        if not concurrent.valid:
+            raise ArtifactStoreError(
+                f"refusing to replace invalid existing artifact object {digest}: "
+                f"{concurrent.reason}"
+            )
+        staging_path.unlink(missing_ok=True)
+        return concurrent.size_bytes or 0
+
     def _publish_staging(self, staging_path: Path, digest: str) -> int:
         target = self.path_for(digest)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -154,15 +164,21 @@ class ContentAddressedArtifactStore:
                 try:
                     self._windows_move_write_through(staging_path, target)
                 except OSError as exc:
-                    if target.exists():
-                        concurrent = self._verify_path(target, digest)
-                        if concurrent.valid:
-                            staging_path.unlink(missing_ok=True)
-                            return concurrent.size_bytes or 0
+                    if target.exists() or target.is_symlink():
+                        return self._reuse_concurrent_target(staging_path, target, digest)
                     raise exc
             else:
-                os.replace(staging_path, target)
+                try:
+                    # A hard-link installation is atomic and fails if the digest path
+                    # appeared after the pre-check. Unlike os.replace(), it can never
+                    # overwrite a racing object at an immutable CAS address.
+                    os.link(staging_path, target, follow_symlinks=False)
+                except FileExistsError:
+                    return self._reuse_concurrent_target(staging_path, target, digest)
+                staging_path.unlink()
                 self._fsync_directory(target.parent)
+        except ArtifactStoreError:
+            raise
         except OSError as exc:
             raise ArtifactStoreError(f"unable to publish artifact object {digest}: {exc}") from exc
 
