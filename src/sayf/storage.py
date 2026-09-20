@@ -264,7 +264,10 @@ class SQLiteEventStore:
             raise LedgerReadError(f"event draft is not canonical JSON: {exc}") from exc
 
         try:
-            self.initialize()
+            try:
+                self.initialize()
+            except LedgerReadError as exc:
+                raise LedgerReadError(f"unable to append to ledger: {exc}") from exc
 
             with self._connect() as connection:
                 try:
