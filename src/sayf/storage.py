@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import tempfile
 import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -238,19 +239,35 @@ class SQLiteEventStore:
         if self._pending_initialization_exists():
             return False
 
+        staging_path: Path | None = None
         try:
-            with marker_path.open("xb") as marker:
+            fd, staging_name = tempfile.mkstemp(
+                prefix=f".{marker_path.name}.",
+                suffix=".tmp",
+                dir=marker_path.parent,
+            )
+            staging_path = Path(staging_name)
+            with os.fdopen(fd, "wb") as marker:
                 marker.write(_PENDING_INITIALIZATION_MARKER)
                 marker.flush()
                 os.fsync(marker.fileno())
+
+            if self._pending_initialization_exists():
+                return False
+
+            os.replace(staging_path, marker_path)
+            staging_path = None
             return True
-        except FileExistsError:
-            self._pending_initialization_exists()
-            return False
         except OSError as exc:
             raise LedgerReadError(
                 f"unable to create initialization pending marker: {exc}"
             ) from exc
+        finally:
+            if staging_path is not None:
+                try:
+                    staging_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _clear_pending_initialization_marker(self) -> None:
         try:
@@ -665,7 +682,7 @@ class SQLiteEventStore:
         rows = connection.execute(
             """
             SELECT type, name, sql FROM sqlite_master
-            WHERE name NOT LIKE 'sqlite_%'
+            WHERE lower(name) NOT GLOB 'sqlite_*'
               AND type IN ('table', 'index', 'trigger', 'view')
             LIMIT ?
             """,
@@ -693,7 +710,7 @@ class SQLiteEventStore:
             connection.execute(
                 """
                 SELECT 1 FROM sqlite_master
-                WHERE name NOT LIKE 'sqlite_%'
+                WHERE lower(name) NOT GLOB 'sqlite_*'
                   AND type IN ('table', 'index', 'trigger', 'view')
                 LIMIT 1
                 """
