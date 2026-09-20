@@ -32,7 +32,7 @@ class StateProjectionError(GraphProjectionError):
 
 
 class ValidityState(StrEnum):
-    VALID = "valid"
+    NOT_INVALIDATED = "not_invalidated"
     INVALIDATED = "invalidated"
 
 
@@ -358,7 +358,9 @@ class EffectiveStateProjection:
             states[record.id] = RecordEffectiveState(
                 record_id=record.id,
                 validity=(
-                    ValidityState.INVALIDATED if invalidations else ValidityState.VALID
+                    ValidityState.INVALIDATED
+                    if invalidations
+                    else ValidityState.NOT_INVALIDATED
                 ),
                 revision=(
                     RevisionState.SUPERSEDED
