@@ -7,7 +7,12 @@ from pydantic import ValidationError
 
 from sayf.causal import CausalRepository
 from sayf.domain import Actor, ActorKind
-from sayf.gates import GateRequestSpec, PolicySnapshotSpec, VerificationReceiptSpec
+from sayf.gates import (
+    GateProjectionError,
+    GateRequestSpec,
+    PolicySnapshotSpec,
+    VerificationReceiptSpec,
+)
 from sayf.records import (
     GateOutcome,
     RecordDraft,
@@ -69,15 +74,22 @@ def test_fail_and_inconclusive_cannot_assert_verified_claim() -> None:
             )
 
 
-def test_policy_contract_names_must_be_unique() -> None:
+def test_policy_contract_names_must_be_unique_before_authoritative_append(
+    tmp_path: Path,
+) -> None:
+    repo = repository(tmp_path)
+    before = len(repo.event_store.events())
+    spec = PolicySnapshotSpec(
+        name="duplicate",
+        requirements=(
+            VerificationRequirement(contract="tests"),
+            VerificationRequirement(contract="tests", minimum_passes=2),
+        ),
+    )
+
     with pytest.raises(ValidationError, match="must be unique"):
-        PolicySnapshotSpec(
-            name="duplicate",
-            requirements=(
-                VerificationRequirement(contract="tests"),
-                VerificationRequirement(contract="tests", minimum_passes=2),
-            ),
-        )
+        repo.register_policy_snapshot(spec, actor=ACTOR, record_id="policy1")
+    assert len(repo.event_store.events()) == before
 
 
 def test_gate_request_subject_is_change_set(tmp_path: Path) -> None:
@@ -92,7 +104,7 @@ def test_gate_request_subject_is_change_set(tmp_path: Path) -> None:
         record_id="policy1",
     )
 
-    with pytest.raises(Exception, match="must have type ChangeSet"):
+    with pytest.raises(GateProjectionError, match="must have type ChangeSet"):
         repo.request_gate(
             GateRequestSpec(
                 subject_id="intent1",
@@ -180,7 +192,7 @@ def test_receipt_for_different_subject_cannot_be_bound_to_request(
         record_id="policy1",
     )
 
-    with pytest.raises(Exception, match="verifies a different subject"):
+    with pytest.raises(GateProjectionError, match="verifies a different subject"):
         repo.request_gate(
             GateRequestSpec(
                 subject_id="change1",
