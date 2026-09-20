@@ -271,6 +271,11 @@ class EffectiveStateProjection:
             raise StateProjectionError(
                 f"supersession relation {relation.id} must connect records of the same type"
             )
+        if source.created_sequence <= target.created_sequence:
+            raise StateProjectionError(
+                f"superseding record {source.id} must be created after superseded record "
+                f"{target.id}"
+            )
         if relation.target_id in superseded_by:
             existing = superseded_by[relation.target_id]
             raise StateProjectionError(
