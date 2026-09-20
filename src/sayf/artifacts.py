@@ -57,6 +57,38 @@ class ContentAddressedArtifactStore:
         finally:
             os.close(fd)
 
+    @classmethod
+    def _ensure_directory_durable(cls, path: Path) -> None:
+        """Create a directory chain and durably anchor each new POSIX entry."""
+        if os.name == "nt":
+            path.mkdir(parents=True, exist_ok=True)
+            if not path.is_dir():
+                raise NotADirectoryError(path)
+            return
+
+        missing: list[Path] = []
+        current = path
+        while not current.exists():
+            missing.append(current)
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+
+        if not current.is_dir():
+            raise NotADirectoryError(current)
+
+        for directory in reversed(missing):
+            try:
+                directory.mkdir()
+            except FileExistsError:
+                if not directory.is_dir():
+                    raise
+            # Persist both the new directory's own metadata and its name in the
+            # parent before relying on descendants or published CAS objects.
+            cls._fsync_directory(directory)
+            cls._fsync_directory(directory.parent)
+
     @staticmethod
     def _windows_move_write_through(source: Path, destination: Path) -> None:
         if os.name != "nt":
@@ -147,17 +179,13 @@ class ContentAddressedArtifactStore:
 
     def _publish_staging(self, staging_path: Path, digest: str) -> int:
         target = self.path_for(digest)
-        target.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_directory_durable(target.parent)
 
-        existing = self._verify_path(target, digest)
+        # Check existence before verification so a target that appears between the
+        # two operations is re-read rather than judged using a stale "missing" result.
+        # A later appearance is handled by the atomic no-replace publication path.
         if target.exists() or target.is_symlink():
-            if not existing.valid:
-                raise ArtifactStoreError(
-                    f"refusing to replace invalid existing artifact object {digest}: "
-                    f"{existing.reason}"
-                )
-            staging_path.unlink(missing_ok=True)
-            return existing.size_bytes or 0
+            return self._reuse_concurrent_target(staging_path, target, digest)
 
         try:
             if os.name == "nt":
@@ -206,7 +234,10 @@ class ContentAddressedArtifactStore:
             name=name,
             metadata={} if metadata is None else metadata,
         )
-        self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            self._ensure_directory_durable(self.root)
+        except OSError as exc:
+            raise ArtifactStoreError(f"unable to create artifact store directory: {exc}") from exc
         staging_path: Path | None = None
         try:
             fd, staging_name = tempfile.mkstemp(prefix=".sayf-artifact-", dir=self.root)
@@ -255,7 +286,10 @@ class ContentAddressedArtifactStore:
             metadata={} if metadata is None else metadata,
         )
 
-        self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            self._ensure_directory_durable(self.root)
+        except OSError as exc:
+            raise ArtifactStoreError(f"unable to create artifact store directory: {exc}") from exc
         staging_path: Path | None = None
         try:
             fd, staging_name = tempfile.mkstemp(prefix=".sayf-artifact-", dir=self.root)
