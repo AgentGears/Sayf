@@ -130,3 +130,29 @@ def test_metadata_validation_does_not_materialize_all_rows(tmp_path) -> None:
             match="Sayf ledger metadata is unsupported or malformed",
         ):
             SQLiteEventStore._validate_schema(ConnectionProxy(connection))
+
+
+def test_read_connection_holds_one_snapshot_across_validation(tmp_path) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    store.initialize()
+
+    with sqlite3.connect(path) as setup:
+        journal_mode = setup.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+    assert str(journal_mode).lower() == "wal"
+
+    with store._read_connection() as reader:
+        with sqlite3.connect(path) as writer:
+            writer.execute(
+                "UPDATE sayf_ledger_meta SET value = '999' WHERE key = 'schema_version'"
+            )
+            writer.commit()
+
+        visible_version = reader.execute(
+            "SELECT value FROM sayf_ledger_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        assert visible_version == "1"
+
+    result = store.verify()
+    assert result.valid is False
+    assert result.reason == "Sayf ledger schema version is unsupported"
