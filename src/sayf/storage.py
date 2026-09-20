@@ -126,16 +126,13 @@ class SQLiteEventStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
 
+    @property
+    def _initialization_lock_path(self) -> Path:
+        return self.path.with_name(f".{self.path.name}.init-lock.sqlite3")
+
     @contextmanager
-    def _connect(
-        self,
-        *,
-        read_only: bool = False,
-        create: bool = False,
-    ) -> Iterator[sqlite3.Connection]:
-        if read_only and create:
-            raise ValueError("read-only SQLite connections cannot create databases")
-        mode = "ro" if read_only else ("rwc" if create else "rw")
+    def _connect(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
+        mode = "ro" if read_only else "rw"
         database = f"{self.path.resolve().as_uri()}?mode={mode}"
         connection = sqlite3.connect(
             database,
@@ -148,6 +145,43 @@ class SQLiteEventStore:
         connection.execute("PRAGMA busy_timeout = 30000")
         try:
             yield connection
+        finally:
+            connection.close()
+
+    @contextmanager
+    def _initialization_guard(self) -> Iterator[None]:
+        lock_path = self._initialization_lock_path
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                lock_path,
+                timeout=30.0,
+                isolation_level=None,
+            )
+            connection.execute("PRAGMA busy_timeout = 30000")
+            connection.execute("BEGIN EXCLUSIVE")
+            integrity = [
+                str(row[0])
+                for row in connection.execute("PRAGMA quick_check").fetchall()
+            ]
+            if integrity != ["ok"]:
+                detail = "; ".join(integrity) if integrity else "no result"
+                raise LedgerReadError(
+                    f"initialization coordination database failed quick_check: {detail}"
+                )
+        except LedgerReadError:
+            if connection is not None:
+                connection.close()
+            raise
+        except sqlite3.Error as exc:
+            if connection is not None:
+                connection.close()
+            raise LedgerReadError(
+                f"unable to acquire ledger initialization lock: {exc}"
+            ) from exc
+
+        try:
+            yield
         finally:
             connection.close()
 
@@ -168,30 +202,54 @@ class SQLiteEventStore:
             raise LedgerReadError(f"unable to read ledger database: {exc}") from exc
 
     def initialize(self) -> None:
+        created_here = False
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            existed_before = self.path.exists()
-            if existed_before and not self.path.is_file():
-                raise LedgerReadError("ledger database path is not a file")
+            with self._initialization_guard():
+                if self.path.exists():
+                    if not self.path.is_file():
+                        raise LedgerReadError("ledger database path is not a file")
+                    self._validate_existing_ledger()
+                    return
 
-            with self._connect(create=not existed_before) as connection:
                 try:
-                    connection.execute("BEGIN EXCLUSIVE")
-                    has_schema = self._has_user_schema_objects(connection)
+                    with self.path.open("xb"):
+                        pass
+                    created_here = True
+                except FileExistsError as exc:
+                    raise LedgerReadError(
+                        "ledger database appeared outside Sayf initialization coordination"
+                    ) from exc
 
-                    if not existed_before and not has_schema:
-                        for statement in _SCHEMA_STATEMENTS:
-                            connection.execute(statement)
+                try:
+                    with self._connect() as connection:
+                        try:
+                            connection.execute("BEGIN EXCLUSIVE")
+                            if self._has_user_schema_objects(connection):
+                                raise LedgerReadError(
+                                    "new ledger database unexpectedly contains schema objects"
+                                )
+                            for statement in _SCHEMA_STATEMENTS:
+                                connection.execute(statement)
 
-                    self._validate_database(connection)
-                    verification, _, _ = self._verify_connection(connection)
-                    if not verification.valid:
-                        raise LedgerReadError(self._verification_error(verification))
-                    connection.execute("COMMIT")
-                except Exception:
-                    if connection.in_transaction:
-                        connection.execute("ROLLBACK")
-                    raise
+                            self._validate_database(connection)
+                            verification, _, _ = self._verify_connection(connection)
+                            if not verification.valid:
+                                raise LedgerReadError(
+                                    self._verification_error(verification)
+                                )
+                            connection.execute("COMMIT")
+                            created_here = False
+                        except Exception:
+                            if connection.in_transaction:
+                                connection.execute("ROLLBACK")
+                            raise
+                finally:
+                    if created_here:
+                        try:
+                            self.path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
         except LedgerReadError:
             raise
         except (OSError, sqlite3.Error) as exc:
@@ -206,10 +264,7 @@ class SQLiteEventStore:
             raise LedgerReadError(f"event draft is not canonical JSON: {exc}") from exc
 
         try:
-            if not self.path.exists():
-                self.initialize()
-            elif not self.path.is_file():
-                raise LedgerReadError("ledger database path is not a file")
+            self.initialize()
 
             with self._connect() as connection:
                 try:
