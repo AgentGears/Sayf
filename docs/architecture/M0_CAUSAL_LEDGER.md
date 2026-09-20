@@ -152,7 +152,9 @@ Before an existing ledger is treated as authoritative, M0.1 applies three layers
 
 This gate applies to `init` on an existing ledger, authoritative event listing, and append. An append performs the check under the same `BEGIN IMMEDIATE` transaction before extending the chain, preventing new state from being based on locally invalid history.
 
-Initialization creates a new ledger or validates the complete local usability of an existing one. It does not repair or migrate damaged storage. Read-only inspection and verification never create schema or files as a side effect.
+Initialization creates a new ledger or validates the complete local usability of an existing one. First-use schema creation runs statement-by-statement inside a single `BEGIN EXCLUSIVE` SQLite transaction, so concurrent initializers serialize through the database writer lock and do not require filesystem hard-link support. An already-existing unknown or empty SQLite file is not silently converted. Initialization does not repair or migrate damaged storage. Read-only inspection and verification never create schema or files as a side effect.
+
+At the database level, `UPDATE` and `DELETE` are rejected for event rows, and replacement-style inserts are rejected when the incoming row collides with an existing `sequence`, `event_id`, or `event_hash`. These guards protect normal database access; they are not an authenticity boundary against an actor able to alter the schema itself.
 
 `ledger verify` streams the event history rather than materializing the full ledger. Its result is a statement about current local usability and consistency, not proof that no privileged writer has ever replaced the history.
 
@@ -192,9 +194,9 @@ M0.1 is complete when:
 2. event sequence is deterministic and contiguous from `1..N`;
 3. event payload and actor metadata are JSON-native and valid UTF-8 before persistence;
 4. canonical stored JSON/timestamp representations are independently checked;
-5. historical rows cannot be updated or deleted through normal database access;
+5. historical rows cannot be updated, deleted, or replaced through normal database access by colliding on event sequence, event ID, or event hash;
 6. SQLite `quick_check` and exact v1 schema/metadata identity pass before authoritative use;
-7. initialization is creation-only/idempotent for locally valid storage and does not repair unknown, damaged, or history-invalid databases;
+7. initialization is creation-only/idempotent for locally valid storage, serializes first-use creation transactionally without requiring hard links, and does not repair unknown, damaged, or history-invalid databases;
 8. hash-chain verification succeeds for valid local history;
 9. verification fails on malformed rows, noncanonical storage, sequence gaps, broken chain links, and modified event content when stored hashes were not recomputed consistently;
 10. authoritative listing and append refuse locally invalid history;
