@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -248,19 +249,17 @@ def test_pending_marker_publish_failure_leaves_no_final_marker_or_target(
     assert list(tmp_path.glob(f".{marker_path.name}.*.tmp")) == []
 
 
-def test_pending_marker_directory_sync_precedes_target_reservation(
+def test_pending_marker_directory_sync_brackets_target_initialization(
     tmp_path,
     monkeypatch,
 ) -> None:
     path = tmp_path / "ledger.sqlite3"
     store = SQLiteEventStore(path)
-    calls = []
+    states = []
 
     def record_directory_sync(directory):
         assert directory == tmp_path
-        assert store._initialization_pending_path.exists()
-        assert not path.exists()
-        calls.append(directory)
+        states.append((store._initialization_pending_path.exists(), path.exists()))
 
     monkeypatch.setattr(
         SQLiteEventStore,
@@ -270,7 +269,7 @@ def test_pending_marker_directory_sync_precedes_target_reservation(
 
     store.initialize()
 
-    assert calls == [tmp_path]
+    assert states == [(True, False), (False, True)]
     assert store.verify().valid is True
 
 
@@ -308,15 +307,12 @@ def test_retry_revalidates_surviving_marker_durability_before_target_reservation
 ) -> None:
     path = tmp_path / "ledger.sqlite3"
     store = SQLiteEventStore(path)
-    sync_calls = 0
+    states = []
 
     def transient_directory_sync(directory):
-        nonlocal sync_calls
-        sync_calls += 1
         assert directory == tmp_path
-        assert store._initialization_pending_path.exists()
-        assert not path.exists()
-        if sync_calls == 1:
+        states.append((store._initialization_pending_path.exists(), path.exists()))
+        if len(states) == 1:
             raise OSError("transient directory sync failure")
 
     monkeypatch.setattr(
@@ -336,10 +332,78 @@ def test_retry_revalidates_surviving_marker_durability_before_target_reservation
 
     store.initialize()
 
-    assert sync_calls == 2
+    assert states == [(True, False), (True, False), (False, True)]
     assert store.verify().valid is True
     assert path.exists()
     assert not store._initialization_pending_path.exists()
+
+
+def test_marker_unlink_failure_blocks_successful_initialization(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    store.initialize()
+
+    with store._initialization_guard():
+        store._ensure_pending_initialization_marker()
+
+    marker_path = store._initialization_pending_path
+    original_unlink = Path.unlink
+
+    def fail_marker_unlink(self, *args, **kwargs):
+        if self == marker_path:
+            raise OSError("forced marker unlink failure")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_marker_unlink)
+
+    with pytest.raises(
+        LedgerReadError,
+        match="unable to durably revoke initialization pending marker",
+    ):
+        store.initialize()
+
+    assert marker_path.exists()
+    assert store.verify().valid is True
+
+
+def test_revocation_sync_failure_blocks_success_and_retry_syncs_absence(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    states = []
+
+    def fail_first_revocation_sync(directory):
+        assert directory == tmp_path
+        states.append((store._initialization_pending_path.exists(), path.exists()))
+        if len(states) == 2:
+            raise OSError("forced revocation directory sync failure")
+
+    monkeypatch.setattr(
+        SQLiteEventStore,
+        "_fsync_directory",
+        staticmethod(fail_first_revocation_sync),
+    )
+
+    with pytest.raises(
+        LedgerReadError,
+        match="unable to durably revoke initialization pending marker",
+    ):
+        store.initialize()
+
+    assert states == [(True, False), (False, True)]
+    assert path.exists()
+    assert not store._initialization_pending_path.exists()
+    assert store.verify().valid is True
+
+    store.initialize()
+
+    assert states == [(True, False), (False, True), (False, True)]
+    assert store.verify().valid is True
 
 
 def test_stale_pending_marker_is_cleared_after_valid_commit(tmp_path) -> None:
