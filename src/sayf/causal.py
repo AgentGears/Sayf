@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from sayf.artifacts import ArtifactVerification, ContentAddressedArtifactStore
-from sayf.domain import Actor, EventDraft
+from sayf.domain import Actor, EventDraft, LedgerEvent
 from sayf.graph import CausalGraph, GraphProjectionError
 from sayf.records import (
     RECORD_CREATED_EVENT_TYPE,
@@ -21,6 +21,13 @@ from sayf.records import (
     relation_from_event,
 )
 from sayf.semantic_append import append_if_ledger_head
+from sayf.state import (
+    DEPENDENCY_BOUND_EVENT_TYPE,
+    RECORD_INVALIDATED_EVENT_TYPE,
+    RECORD_SUPERSEDED_EVENT_TYPE,
+    EffectiveStateProjection,
+    semantic_relation_event_payload,
+)
 from sayf.storage import LedgerReadError, SQLiteEventStore
 
 
@@ -35,7 +42,7 @@ def _validate_requested_record_id(record_id: Any) -> str:
 
 
 class CausalRepository:
-    """Authoritative typed-write facade over the immutable M0.1 event ledger."""
+    """Authoritative semantic facade over the immutable Sayf event ledger."""
 
     def __init__(
         self,
@@ -56,15 +63,26 @@ class CausalRepository:
             artifact_store=ContentAddressedArtifactStore(artifact_root),
         )
 
-    def _graph_snapshot(self) -> tuple[CausalGraph, int, str | None]:
+    def _semantic_snapshot(
+        self,
+    ) -> tuple[CausalGraph, EffectiveStateProjection, int, str | None]:
         events = self.event_store.events()
         graph = CausalGraph.from_events(events)
+        state = EffectiveStateProjection.from_events(events, graph=graph)
         head_hash = events[-1].event_hash if events else None
-        return graph, len(events), head_hash
+        return graph, state, len(events), head_hash
+
+    def _graph_snapshot(self) -> tuple[CausalGraph, int, str | None]:
+        graph, _, event_count, head_hash = self._semantic_snapshot()
+        return graph, event_count, head_hash
 
     def graph(self) -> CausalGraph:
-        graph, _, _ = self._graph_snapshot()
+        graph, _, _, _ = self._semantic_snapshot()
         return graph
+
+    def effective_state(self) -> EffectiveStateProjection:
+        _, state, _, _ = self._semantic_snapshot()
+        return state
 
     def create_record(self, draft: RecordDraft, *, actor: Actor) -> Record:
         snapshot = RecordDraft.model_validate(draft.model_dump(mode="python"))
@@ -117,6 +135,58 @@ class CausalRepository:
             expected_head_hash=expected_head_hash,
         )
         return relation_from_event(event)
+
+    def _activate_state_relation(
+        self,
+        relation_id: str,
+        *,
+        event_type: str,
+        actor: Actor,
+    ) -> LedgerEvent:
+        self.event_store.initialize()
+        _, state, expected_event_count, expected_head_hash = self._semantic_snapshot()
+
+        if event_type == DEPENDENCY_BOUND_EVENT_TYPE:
+            relation = state.validate_dependency_binding(relation_id)
+        elif event_type == RECORD_INVALIDATED_EVENT_TYPE:
+            relation = state.validate_invalidation(relation_id)
+        elif event_type == RECORD_SUPERSEDED_EVENT_TYPE:
+            relation = state.validate_supersession(relation_id)
+        else:
+            raise ValueError(f"unsupported M0.3 state event type {event_type}")
+
+        return append_if_ledger_head(
+            self.event_store,
+            EventDraft(
+                stream_id=f"state:{relation.id}",
+                event_type=event_type,
+                actor=actor,
+                payload=semantic_relation_event_payload(relation),
+            ),
+            expected_event_count=expected_event_count,
+            expected_head_hash=expected_head_hash,
+        )
+
+    def bind_dependency(self, relation_id: str, *, actor: Actor) -> LedgerEvent:
+        return self._activate_state_relation(
+            relation_id,
+            event_type=DEPENDENCY_BOUND_EVENT_TYPE,
+            actor=actor,
+        )
+
+    def invalidate(self, relation_id: str, *, actor: Actor) -> LedgerEvent:
+        return self._activate_state_relation(
+            relation_id,
+            event_type=RECORD_INVALIDATED_EVENT_TYPE,
+            actor=actor,
+        )
+
+    def supersede(self, relation_id: str, *, actor: Actor) -> LedgerEvent:
+        return self._activate_state_relation(
+            relation_id,
+            event_type=RECORD_SUPERSEDED_EVENT_TYPE,
+            actor=actor,
+        )
 
     def register_artifact_file(
         self,
