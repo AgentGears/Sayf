@@ -59,12 +59,18 @@ This preserves a strict distinction between recording a relationship claim and a
 M0.3 deliberately avoids collapsing all lifecycle meaning into one status enum. Each record has three independent derived axes:
 
 ```text
-validity:   valid | invalidated
+validity:   not_invalidated | invalidated
 revision:   current | superseded
 freshness:  fresh | stale
 ```
 
-A record may therefore be, for example, valid but stale, or invalidated and also superseded. The axes preserve the reason for state instead of hiding it behind a precedence rule.
+These labels have strict claim ceilings:
+
+- `not_invalidated` means only that no qualified invalidation of the record exists in the projected history. It does **not** mean true, accepted, sufficient, verified, or correct.
+- `current` means only that the record has not been superseded by a qualified M0.3 transition. It does **not** mean accepted as the authoritative intent or otherwise approved.
+- `fresh` means only that no qualified dependency path currently connects the record to an invalidated or superseded root. It does **not** mean verified, safe, complete, or pass.
+
+A record may therefore be `not_invalidated` but stale, or invalidated and also superseded. The axes preserve the reason for state instead of hiding it behind a precedence rule or promoting absence of negative evidence into a positive claim.
 
 ### Validity
 
@@ -74,7 +80,7 @@ A qualified `invalidates` relation has direction:
 cause -> invalidated record
 ```
 
-The target record becomes `invalidated`. Multiple independent invalidation causes are permitted and retained in deterministic event order.
+The target record becomes `invalidated`. Multiple independent invalidation causes are permitted and retained in deterministic event order. Before such a transition, the record is only `not_invalidated`; M0.3 does not infer positive validity.
 
 ### Revision
 
@@ -116,7 +122,7 @@ B becomes stale
 C becomes stale
 ```
 
-The root record itself is not marked stale merely because it is invalidated or superseded; its direct axis records that transition. Dependents become stale because an input they rely on is no longer current/valid.
+The root record itself is not marked stale merely because it is invalidated or superseded; its direct axis records that transition. Dependents become stale because an input they rely on is no longer current/valid for the qualified dependency relationship.
 
 Propagation is deterministic and cycle-safe. For each root, the projection retains one canonical shortest dependency path to each affected record, using qualification sequence and relation ID as deterministic traversal order. M0.3 does not claim that this stored path is every possible causal path; full multi-path explainability remains an M0.5 concern.
 
@@ -193,7 +199,7 @@ This is deliberately smaller than the eventual release-feedback scenario. It pro
 1. **No retroactive authority** — pre-existing M0.2 relation labels do not acquire M0.3 effects without a qualification event.
 2. **Exact relation binding** — a state event binds both relation ID and immutable relation content hash.
 3. **No forward state references** — a relation must already exist before it can be qualified.
-4. **Independent state axes** — validity, revision, and freshness remain separately explainable.
+4. **Independent state axes with claim ceilings** — absence of invalidation, supersession, or stale dependencies is not promoted into truth, acceptance, verification, or pass.
 5. **Only qualified dependencies propagate staleness** — generic graph adjacency is not silently treated as authority.
 6. **Deterministic propagation** — the same verified history yields the same affected set and canonical stale-cause paths.
 7. **Linear supersession for M0.3** — ambiguous branching/merge revision lineages fail closed rather than being guessed.
@@ -209,7 +215,7 @@ M0.3 is complete when:
 
 1. M0.2 `depends_on`, `invalidates`, and `supersedes` relations remain inert until explicitly qualified;
 2. qualification events bind an earlier relation ID and exact content hash;
-3. invalidation preserves direct cause/relation/event provenance;
+3. invalidation preserves direct cause/relation/event provenance without claiming positive validity before invalidation;
 4. supersession preserves direct superseder/relation/event provenance;
 5. same-type linear supersession is enforced deterministically;
 6. invalidated and superseded roots make qualified transitive dependents stale;
@@ -219,4 +225,4 @@ M0.3 is complete when:
 10. raw CLI append cannot impersonate reserved M0.3 state events;
 11. the A1 -> I1 -> invalidation -> staleness -> I2 acceptance slice passes end to end;
 12. all M0.1/M0.2 tests remain green on Ubuntu and Windows;
-13. authorization and performance boundaries are documented without introducing premature policy or projection infrastructure.
+13. authorization, claim ceilings, and performance boundaries are documented without introducing premature policy or projection infrastructure.
