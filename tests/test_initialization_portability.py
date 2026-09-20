@@ -72,8 +72,10 @@ def test_coordination_sidecar_name_is_bounded_for_long_ledger_filename(tmp_path)
     assert len(os.fsencode(path.name)) == 240
     assert len(os.fsencode(store._initialization_lock_path.name)) < 255
     assert len(os.fsencode(store._initialization_pending_path.name)) < 255
+    assert len(os.fsencode(store._initialization_revoked_path.name)) < 255
     assert store._initialization_lock_path.name.startswith(".sayf-init-")
     assert store._initialization_pending_path.name.startswith(".sayf-init-recovery-")
+    assert store._initialization_revoked_path.name.startswith(".sayf-init-recovery-")
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX component-limit regression")
@@ -225,6 +227,7 @@ def test_pending_marker_does_not_treat_sqlitex_as_sqlite_owned(tmp_path) -> None
     assert names == {"sqlitex"}
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX marker publication regression")
 def test_pending_marker_publish_failure_leaves_no_final_marker_or_target(
     tmp_path,
     monkeypatch,
@@ -249,6 +252,7 @@ def test_pending_marker_publish_failure_leaves_no_final_marker_or_target(
     assert list(tmp_path.glob(f".{marker_path.name}.*.tmp")) == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync regression")
 def test_pending_marker_directory_sync_brackets_target_initialization(
     tmp_path,
     monkeypatch,
@@ -273,6 +277,7 @@ def test_pending_marker_directory_sync_brackets_target_initialization(
     assert store.verify().valid is True
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync regression")
 def test_pending_marker_directory_sync_failure_prevents_target_reservation(
     tmp_path,
     monkeypatch,
@@ -301,6 +306,7 @@ def test_pending_marker_directory_sync_failure_prevents_target_reservation(
     assert not path.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync regression")
 def test_retry_revalidates_surviving_marker_durability_before_target_reservation(
     tmp_path,
     monkeypatch,
@@ -338,6 +344,7 @@ def test_retry_revalidates_surviving_marker_durability_before_target_reservation
     assert not store._initialization_pending_path.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX unlink durability regression")
 def test_marker_unlink_failure_blocks_successful_initialization(
     tmp_path,
     monkeypatch,
@@ -369,6 +376,7 @@ def test_marker_unlink_failure_blocks_successful_initialization(
     assert store.verify().valid is True
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync regression")
 def test_revocation_sync_failure_blocks_success_and_retry_syncs_absence(
     tmp_path,
     monkeypatch,
@@ -420,3 +428,190 @@ def test_stale_pending_marker_is_cleared_after_valid_commit(tmp_path) -> None:
 
     assert store.verify().valid is True
     assert not store._initialization_pending_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows write-through regression")
+def test_windows_write_through_move_replaces_destination(tmp_path) -> None:
+    source = tmp_path / "source.pending"
+    destination = tmp_path / "destination.pending"
+    source.write_text("new", encoding="utf-8")
+    destination.write_text("old", encoding="utf-8")
+
+    SQLiteEventStore._windows_move_file_write_through(
+        source,
+        destination,
+        replace_existing=True,
+    )
+
+    assert not source.exists()
+    assert destination.read_text(encoding="utf-8") == "new"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows write-through regression")
+def test_windows_initialization_uses_write_through_marker_transitions(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    pending = store._initialization_pending_path
+    revoked = store._initialization_revoked_path
+    calls = []
+    original_move = SQLiteEventStore._windows_move_file_write_through
+
+    def record_move(source, destination, *, replace_existing):
+        calls.append((Path(source), Path(destination), replace_existing))
+        original_move(source, destination, replace_existing=replace_existing)
+
+    monkeypatch.setattr(
+        SQLiteEventStore,
+        "_windows_move_file_write_through",
+        staticmethod(record_move),
+    )
+
+    store.initialize()
+
+    assert len(calls) == 2
+    assert calls[0][1:] == (pending, False)
+    assert calls[1] == (pending, revoked, True)
+    assert store.verify().valid is True
+    assert not pending.exists()
+    assert not revoked.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows write-through regression")
+def test_windows_publish_failure_prevents_target_reservation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+
+    def fail_move(source, destination, *, replace_existing):
+        raise OSError("forced write-through publication failure")
+
+    monkeypatch.setattr(
+        SQLiteEventStore,
+        "_windows_move_file_write_through",
+        staticmethod(fail_move),
+    )
+
+    with pytest.raises(
+        LedgerReadError,
+        match="unable to create initialization pending marker",
+    ):
+        store.initialize()
+
+    assert not path.exists()
+    assert not store._initialization_pending_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows write-through regression")
+def test_windows_recovery_reasserts_existing_marker_write_through(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    pending = store._initialization_pending_path
+    revoked = store._initialization_revoked_path
+
+    with store._initialization_guard():
+        store._ensure_pending_initialization_marker()
+        with sqlite3.connect(path) as connection:
+            connection.execute("VACUUM")
+
+    calls = []
+    original_move = SQLiteEventStore._windows_move_file_write_through
+
+    def record_move(source, destination, *, replace_existing):
+        calls.append((Path(source), Path(destination), replace_existing))
+        original_move(source, destination, replace_existing=replace_existing)
+
+    monkeypatch.setattr(
+        SQLiteEventStore,
+        "_windows_move_file_write_through",
+        staticmethod(record_move),
+    )
+
+    store.initialize()
+
+    assert len(calls) == 2
+    assert calls[0][1:] == (pending, True)
+    assert calls[1] == (pending, revoked, True)
+    assert store.verify().valid is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows write-through regression")
+def test_windows_revocation_failure_blocks_success_and_retry(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    pending = store._initialization_pending_path
+    revoked = store._initialization_revoked_path
+    original_move = SQLiteEventStore._windows_move_file_write_through
+    failed = False
+
+    def fail_first_revocation(source, destination, *, replace_existing):
+        nonlocal failed
+        if Path(source) == pending and Path(destination) == revoked and not failed:
+            failed = True
+            raise OSError("forced write-through revocation failure")
+        original_move(source, destination, replace_existing=replace_existing)
+
+    monkeypatch.setattr(
+        SQLiteEventStore,
+        "_windows_move_file_write_through",
+        staticmethod(fail_first_revocation),
+    )
+
+    with pytest.raises(
+        LedgerReadError,
+        match="unable to durably revoke initialization pending marker",
+    ):
+        store.initialize()
+
+    assert path.exists()
+    assert pending.exists()
+    assert store.verify().valid is True
+
+    store.initialize()
+
+    assert store.verify().valid is True
+    assert not pending.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows write-through regression")
+def test_windows_revoked_tombstone_never_authorizes_recovery(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    store = SQLiteEventStore(path)
+    revoked = store._initialization_revoked_path
+    original_unlink = Path.unlink
+
+    def keep_revoked_tombstone(self, *args, **kwargs):
+        if self == revoked:
+            raise OSError("forced tombstone cleanup failure")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", keep_revoked_tombstone)
+
+    store.initialize()
+
+    assert store.verify().valid is True
+    assert not store._initialization_pending_path.exists()
+    assert revoked.exists()
+
+    path.unlink()
+    with sqlite3.connect(path):
+        pass
+
+    with pytest.raises(LedgerReadError, match="schema marker is missing"):
+        store.initialize()
+
+    assert not store._initialization_pending_path.exists()
+    assert revoked.exists()

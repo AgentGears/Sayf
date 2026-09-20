@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
@@ -19,6 +20,8 @@ from sayf.hashing import canonical_json, compute_event_hash
 _LEDGER_SCHEMA_VERSION = "1"
 _IMMUTABILITY_MESSAGE = "Sayf ledger events are immutable"
 _PENDING_INITIALIZATION_MARKER = b"sayf-initialization-pending-v1\n"
+_MOVEFILE_REPLACE_EXISTING = 0x00000001
+_MOVEFILE_WRITE_THROUGH = 0x00000008
 
 _META_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS sayf_ledger_meta (
@@ -160,6 +163,13 @@ class SQLiteEventStore:
             f".sayf-init-recovery-{self._initialization_recovery_key}.pending"
         )
 
+    @property
+    def _initialization_revoked_path(self) -> Path:
+        target = self.path.resolve(strict=False)
+        return target.parent / (
+            f".sayf-init-recovery-{self._initialization_recovery_key}.revoked"
+        )
+
     @staticmethod
     def _fsync_directory(path: Path) -> None:
         if os.name == "nt":
@@ -173,6 +183,36 @@ class SQLiteEventStore:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+
+    @staticmethod
+    def _windows_move_file_write_through(
+        source: Path,
+        destination: Path,
+        *,
+        replace_existing: bool,
+    ) -> None:
+        if os.name != "nt":
+            raise OSError("Windows write-through move requested on non-Windows platform")
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        move_file_ex = kernel32.MoveFileExW
+        move_file_ex.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+        ]
+        move_file_ex.restype = ctypes.c_int
+
+        flags = _MOVEFILE_WRITE_THROUGH
+        if replace_existing:
+            flags |= _MOVEFILE_REPLACE_EXISTING
+
+        if move_file_ex(str(source), str(destination), flags):
+            return
+
+        error_code = ctypes.get_last_error()
+        detail = ctypes.FormatError(error_code).strip()
+        raise OSError(error_code, f"MoveFileExW failed: {detail}")
 
     @contextmanager
     def _connect(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
@@ -250,7 +290,8 @@ class SQLiteEventStore:
 
     def _ensure_pending_initialization_marker(self) -> bool:
         marker_path = self._initialization_pending_path
-        if self._pending_initialization_exists():
+        marker_already_exists = self._pending_initialization_exists()
+        if marker_already_exists and os.name != "nt":
             try:
                 self._fsync_directory(marker_path.parent)
             except OSError as exc:
@@ -272,12 +313,28 @@ class SQLiteEventStore:
                 marker.flush()
                 os.fsync(marker.fileno())
 
-            if self._pending_initialization_exists():
-                self._fsync_directory(marker_path.parent)
+            marker_exists_now = marker_already_exists or self._pending_initialization_exists()
+            if marker_exists_now:
+                if os.name == "nt":
+                    self._windows_move_file_write_through(
+                        staging_path,
+                        marker_path,
+                        replace_existing=True,
+                    )
+                    staging_path = None
+                else:
+                    self._fsync_directory(marker_path.parent)
                 return False
 
-            os.replace(staging_path, marker_path)
-            self._fsync_directory(marker_path.parent)
+            if os.name == "nt":
+                self._windows_move_file_write_through(
+                    staging_path,
+                    marker_path,
+                    replace_existing=False,
+                )
+            else:
+                os.replace(staging_path, marker_path)
+                self._fsync_directory(marker_path.parent)
             staging_path = None
             return True
         except LedgerReadError:
@@ -297,6 +354,18 @@ class SQLiteEventStore:
         marker_path = self._initialization_pending_path
         if marker_path.exists():
             raise LedgerReadError("initialization pending marker unexpectedly exists")
+
+        if os.name == "nt":
+            try:
+                self._initialization_revoked_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if marker_path.exists():
+                raise LedgerReadError(
+                    "initialization pending marker appeared during absence validation"
+                )
+            return
+
         try:
             self._fsync_directory(marker_path.parent)
         except OSError as exc:
@@ -309,6 +378,25 @@ class SQLiteEventStore:
 
     def _clear_pending_initialization_marker(self) -> None:
         marker_path = self._initialization_pending_path
+        if os.name == "nt":
+            revoked_path = self._initialization_revoked_path
+            try:
+                self._windows_move_file_write_through(
+                    marker_path,
+                    revoked_path,
+                    replace_existing=True,
+                )
+            except OSError as exc:
+                raise LedgerReadError(
+                    f"unable to durably revoke initialization pending marker: {exc}"
+                ) from exc
+
+            try:
+                revoked_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+
         try:
             marker_path.unlink(missing_ok=True)
             self._fsync_directory(marker_path.parent)
