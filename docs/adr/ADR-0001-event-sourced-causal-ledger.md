@@ -27,7 +27,7 @@ For the initial implementation:
 - before reserving a missing target, the lock owner writes the recovery token to a same-directory staging file, flushes and fsyncs it, atomically publishes the target-specific pending-initialization marker, and on POSIX fsyncs the containing directory before target reservation; target reservation occurs only after that durability step succeeds;
 - after acquiring the barrier and durably publishing the marker, the owner reserves the target path with exclusive file creation and creates the v1 schema inside a single SQLite transaction;
 - an interrupted initialization is recoverable only when the target-specific marker exists and the target remains schema-less SQLite storage; arbitrary existing or user-schema-bearing databases remain fail-closed;
-- a stale pending marker beside an already valid Sayf ledger is cleared after the ledger passes normal validation;
+- recovery authorization is durably revoked before initialization reports success: the marker is removed and, on POSIX, its parent directory is fsynced; unlink or revocation-sync failure makes initialization fail, and an idempotent retry with no visible marker must durably fsync that absence before it can report success;
 - a global unkeyed SHA-256 hash chain provides an internal chain-consistency check;
 - verification checks contiguous `1..N` sequence state, canonical stored representations, hash linkage, and canonical event hashes;
 - authoritative read operations hold one explicit SQLite read transaction from `quick_check` and exact schema/metadata validation through event-history consumption, so the usability result describes one database snapshot;
@@ -38,7 +38,7 @@ For the initial implementation:
 - larger immutable artifacts will use content-addressed filesystem storage in M0.2;
 - human-readable Markdown/JSON files are projections, not authoritative state.
 
-The coordination sidecar and pending marker contain no authoritative Sayf state. The sidecar exists only for cross-process first-use serialization. The marker records only that Sayf had begun creating one specific recovery identity under that barrier so a crash-interrupted schema-less target can be retried safely. A partially written staging file is not a recovery authorization token; only the fully published final marker is recognized. On POSIX, the marker rename is not considered durably published until the containing directory has also been fsynced.
+The coordination sidecar and pending marker contain no authoritative Sayf state. The sidecar exists only for cross-process first-use serialization. The marker records only that Sayf had begun creating one specific recovery identity under that barrier so a crash-interrupted schema-less target can be retried safely. A partially written staging file is not a recovery authorization token; only the fully published final marker is recognized. On POSIX, the marker rename is not considered durably published until the containing directory has also been fsynced, and marker deletion is not considered durably revoked until the directory has been fsynced after unlink. A committed ledger does not make initialization successful while recovery authorization remains uncertain.
 
 ## Trust boundary
 
@@ -70,6 +70,7 @@ A graph database, distributed log, ORM, or event-streaming platform would add in
 - case-insensitive path aliases conservatively share one first-use barrier;
 - conservative lock-key collisions cannot cross-authorize recovery of distinct case-sensitive targets;
 - the recovery token is fully published before target reservation, and on POSIX its directory entry is fsynced before a recoverable target may appear;
+- successful initialization also durably revokes the recovery token, preventing stale recovery authorization from surviving a completed initialization;
 - a process/host interruption after durable marker publication during first-use initialization can be retried when Sayf's target-specific pending marker proves the schema-less target came from an interrupted Sayf creation attempt;
 - schema lookalikes such as `sqlitex` cannot evade exact-schema or interrupted-recovery validation by matching a wildcard approximation of `sqlite_`;
 - supersession and invalidation can later be expressed without rewriting old semantic state;
@@ -82,7 +83,8 @@ A graph database, distributed log, ORM, or event-streaming platform would add in
 - schema evolution must be explicit and versioned;
 - projections must be rebuildable and version-aware;
 - a small non-authoritative SQLite coordination sidecar and, transiently, a pending marker accompany first-use initialization;
-- durable POSIX marker publication adds a parent-directory fsync before target reservation;
+- durable POSIX marker publication and revocation add parent-directory fsync operations around recovery authorization;
+- a ledger can already be locally valid while `init` still reports failure if marker revocation durability cannot be established; retry is required before initialization is considered successful;
 - conservative case folding can serialize distinct case-sensitive paths that differ only by case, reducing initialization concurrency but not correctness;
 - on a case-insensitive POSIX filesystem, recovery through a differently cased spelling may fail closed because recovery identity is intentionally stricter than lock identity;
 - M0.1 append re-verifies the full existing event history, making each append O(N) in ledger length and a sequence of N appends O(N²) overall;
@@ -131,6 +133,10 @@ Rejected because conservative case folding is useful for serialization on case-i
 ### Direct in-place creation of the pending marker
 
 Rejected because an interruption during a direct write can leave a truncated or malformed final marker that wedges retry. The recovery token is staged in the same directory, flushed and fsynced, atomically renamed into its final path, and on POSIX the containing directory is fsynced before the target ledger is reserved.
+
+### Best-effort recovery-marker cleanup
+
+Rejected because a failed or non-durable unlink can leave or resurrect stale recovery authorization. Marker revocation is therefore part of initialization success: deletion must succeed and, on POSIX, the parent directory must be fsynced. If an earlier revocation sync failed after the marker disappeared from the live filesystem, a later successful initialization must first durably establish the marker's absence.
 
 ### Autocommit read validation followed by a separate history scan
 
