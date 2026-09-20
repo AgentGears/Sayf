@@ -21,7 +21,11 @@ For the initial implementation:
 - SQLite `quick_check` validates the local database container before authoritative use;
 - database triggers reject event updates, deletes, and replacement-insert collisions during normal access;
 - first-use ownership is serialized **before the target ledger path is inspected** by an exclusive lock in a tiny non-authoritative SQLite coordination sidecar;
+- coordination filenames use a fixed-length SHA-256 key of the normalized, case-folded resolved target path so lexical/case aliases share the same initialization barrier conservatively;
+- before reserving a missing target, the lock owner creates a small non-authoritative pending-initialization marker that survives independently of the target's schema transaction;
 - after acquiring that barrier, the owner reserves the target path with exclusive file creation and creates the v1 schema inside a single SQLite transaction;
+- an interrupted initialization is recoverable only when that marker exists and the target remains schema-less SQLite storage; arbitrary existing or user-schema-bearing databases remain fail-closed;
+- a stale pending marker beside an already valid Sayf ledger is cleared after the ledger passes normal validation;
 - a global unkeyed SHA-256 hash chain provides an internal chain-consistency check;
 - verification checks contiguous `1..N` sequence state, canonical stored representations, hash linkage, and canonical event hashes;
 - initialization, authoritative listing, and append fail closed when existing local history is invalid;
@@ -31,7 +35,7 @@ For the initial implementation:
 - larger immutable artifacts will use content-addressed filesystem storage in M0.2;
 - human-readable Markdown/JSON files are projections, not authoritative state.
 
-The coordination sidecar contains no authoritative Sayf state. Its sole purpose is cross-process first-use ownership, and SQLite releases its lock when a process or connection terminates.
+The coordination sidecar and pending marker contain no authoritative Sayf state. The sidecar exists only for cross-process first-use ownership. The marker records only that Sayf had begun creating that exact target under the barrier so a crash-interrupted schema-less target can be retried safely.
 
 ## Trust boundary
 
@@ -59,6 +63,8 @@ A graph database, distributed log, ORM, or event-streaming platform would add in
 - unknown or damaged databases are not silently repaired or converted;
 - first-use initialization does not depend on filesystem hard-link capability;
 - concurrent first-use ownership is decided before any contender classifies the target path;
+- case-insensitive path aliases conservatively share one first-use barrier;
+- a process/host interruption during first-use initialization can be retried when Sayf's pending marker proves the schema-less target came from an interrupted Sayf creation attempt;
 - supersession and invalidation can later be expressed without rewriting old semantic state;
 - adapters do not need an LLM to inspect authoritative history;
 - later projections can be rebuilt from source events;
@@ -68,7 +74,8 @@ A graph database, distributed log, ORM, or event-streaming platform would add in
 
 - schema evolution must be explicit and versioned;
 - projections must be rebuildable and version-aware;
-- a small non-authoritative SQLite coordination sidecar accompanies the ledger for initialization locking;
+- a small non-authoritative SQLite coordination sidecar and, transiently, a pending marker accompany first-use initialization;
+- conservative case folding can serialize distinct case-sensitive paths that differ only by case, reducing initialization concurrency but not correctness;
 - M0.1 append re-verifies the full existing event history, making each append O(N) in ledger length and a sequence of N appends O(N²) overall;
 - SQLite integrity checking adds additional local I/O before authoritative use;
 - distributed multi-writer operation is deferred;
@@ -107,6 +114,10 @@ Rejected because it makes otherwise-valid SQLite deployments depend on a filesys
 ### Target-ledger locking without pre-creation ownership
 
 Rejected because SQLite creates an `rwc` target before the first target transaction can acquire its lock, leaving a race where a contender can mistake an in-progress target for pre-existing unknown storage. The coordination lock must therefore be acquired independently before the target path is inspected.
+
+### Treating all empty SQLite files as interrupted initialization
+
+Rejected because that would silently legitimize unrelated pre-existing storage. Recovery requires Sayf's pending marker, created under the first-use coordination barrier, and still accepts only schema-less SQLite as a recoverable target.
 
 ### External checkpointing in M0.1
 
