@@ -72,7 +72,7 @@ def test_coordination_sidecar_name_is_bounded_for_long_ledger_filename(tmp_path)
     assert len(os.fsencode(store._initialization_lock_path.name)) < 255
     assert len(os.fsencode(store._initialization_pending_path.name)) < 255
     assert store._initialization_lock_path.name.startswith(".sayf-init-")
-    assert store._initialization_pending_path.name.startswith(".sayf-init-")
+    assert store._initialization_pending_path.name.startswith(".sayf-init-recovery-")
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX component-limit regression")
@@ -93,7 +93,45 @@ def test_case_variants_share_initialization_coordination_key(tmp_path) -> None:
 
     assert upper._initialization_coordination_key == lower._initialization_coordination_key
     assert upper._initialization_lock_path == lower._initialization_lock_path
-    assert upper._initialization_pending_path == lower._initialization_pending_path
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows path identity is case-insensitive")
+def test_case_variants_use_distinct_recovery_markers_on_case_sensitive_posix(tmp_path) -> None:
+    upper = SQLiteEventStore(tmp_path / "Ledger.sqlite3")
+    lower = SQLiteEventStore(tmp_path / "ledger.sqlite3")
+
+    assert upper._initialization_lock_path == lower._initialization_lock_path
+    assert upper._initialization_recovery_key != lower._initialization_recovery_key
+    assert upper._initialization_pending_path != lower._initialization_pending_path
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows path identity is case-insensitive")
+def test_pending_marker_cannot_cross_authorize_case_variant_target(tmp_path) -> None:
+    upper = SQLiteEventStore(tmp_path / "Ledger.sqlite3")
+    lower_path = tmp_path / "ledger.sqlite3"
+    lower = SQLiteEventStore(lower_path)
+
+    with upper._initialization_guard():
+        upper._ensure_pending_initialization_marker()
+
+    with sqlite3.connect(lower_path):
+        pass
+
+    assert upper._initialization_pending_path.exists()
+    assert not lower._initialization_pending_path.exists()
+
+    with pytest.raises(LedgerReadError, match="schema marker is missing"):
+        lower.initialize()
+
+    with sqlite3.connect(lower_path) as connection:
+        user_objects = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%'
+              AND type IN ('table', 'index', 'trigger', 'view')
+            """
+        ).fetchall()
+    assert user_objects == []
 
 
 def test_interrupted_schema_less_initialization_is_recoverable(tmp_path) -> None:
