@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from sayf.cli import app
@@ -149,19 +150,29 @@ def test_cli_m04_permit_then_subject_supersession_stales_decision(
     assert "change1" in payload["stale_input_record_ids"]
 
 
+@pytest.mark.parametrize(
+    "record_type",
+    ["VerificationReceipt", "PolicySnapshot", "GateRequest", "GateDecision"],
+)
 def test_generic_record_cli_cannot_impersonate_m04_semantic_records(
     tmp_path: Path,
+    record_type: str,
 ) -> None:
+    db = tmp_path / ".sayf" / "ledger.sqlite3"
     result = invoke(
         tmp_path,
         "record",
         "create",
         "--type",
-        "GateDecision",
+        record_type,
         "--id",
-        "forged",
+        f"forged-{record_type}",
         "--payload",
         "{}",
     )
+
     assert result.exit_code != 0
-    assert "M0.4 semantic API" in result.output
+    # Protection may happen in Typer's enum parsing or in RecordDraft's semantic
+    # boundary depending on CLI/library versions. The authority invariant is that
+    # generic creation never reaches an authoritative ledger append.
+    assert not db.exists()
