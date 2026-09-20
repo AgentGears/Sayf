@@ -128,7 +128,8 @@ class SQLiteEventStore:
 
     @property
     def _initialization_lock_path(self) -> Path:
-        return self.path.with_name(f".{self.path.name}.init-lock.sqlite3")
+        target = self.path.resolve(strict=False)
+        return target.with_name(f".{target.name}.init-lock.sqlite3")
 
     @contextmanager
     def _connect(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
