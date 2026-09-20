@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
-import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
@@ -22,6 +20,11 @@ CREATE TABLE IF NOT EXISTS sayf_ledger_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 )
+"""
+
+_SCHEMA_VERSION_SQL = f"""
+INSERT OR IGNORE INTO sayf_ledger_meta (key, value)
+VALUES ('schema_version', '{_LEDGER_SCHEMA_VERSION}')
 """
 
 _EVENTS_TABLE_SQL = """
@@ -73,18 +76,15 @@ BEGIN
 END
 """
 
-_SCHEMA = f"""
-{_META_TABLE_SQL};
-
-INSERT OR IGNORE INTO sayf_ledger_meta (key, value)
-VALUES ('schema_version', '{_LEDGER_SCHEMA_VERSION}');
-
-{_EVENTS_TABLE_SQL};
-{_STREAM_INDEX_SQL};
-{_INSERT_TRIGGER_SQL};
-{_UPDATE_TRIGGER_SQL};
-{_DELETE_TRIGGER_SQL};
-"""
+_SCHEMA_STATEMENTS = (
+    _META_TABLE_SQL,
+    _SCHEMA_VERSION_SQL,
+    _EVENTS_TABLE_SQL,
+    _STREAM_INDEX_SQL,
+    _INSERT_TRIGGER_SQL,
+    _UPDATE_TRIGGER_SQL,
+    _DELETE_TRIGGER_SQL,
+)
 
 
 def _normalize_schema_sql(sql: str) -> str:
@@ -127,8 +127,15 @@ class SQLiteEventStore:
         self.path = Path(path)
 
     @contextmanager
-    def _connect(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
-        mode = "ro" if read_only else "rw"
+    def _connect(
+        self,
+        *,
+        read_only: bool = False,
+        create: bool = False,
+    ) -> Iterator[sqlite3.Connection]:
+        if read_only and create:
+            raise ValueError("read-only SQLite connections cannot create databases")
+        mode = "ro" if read_only else ("rwc" if create else "rw")
         database = f"{self.path.resolve().as_uri()}?mode={mode}"
         connection = sqlite3.connect(
             database,
@@ -161,52 +168,34 @@ class SQLiteEventStore:
             raise LedgerReadError(f"unable to read ledger database: {exc}") from exc
 
     def initialize(self) -> None:
-        candidate: Path | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            if self.path.exists():
-                if not self.path.is_file():
-                    raise LedgerReadError("ledger database path is not a file")
-                self._validate_existing_ledger()
-                return
+            existed_before = self.path.exists()
+            if existed_before and not self.path.is_file():
+                raise LedgerReadError("ledger database path is not a file")
 
-            fd, candidate_name = tempfile.mkstemp(
-                dir=self.path.parent,
-                prefix=f".{self.path.name}.init-",
-                suffix=".sqlite3",
-            )
-            os.close(fd)
-            candidate = Path(candidate_name)
-            candidate_store = SQLiteEventStore(candidate)
+            with self._connect(create=not existed_before) as connection:
+                try:
+                    connection.execute("BEGIN EXCLUSIVE")
+                    has_schema = self._has_user_schema_objects(connection)
 
-            with candidate_store._connect() as connection:
-                connection.executescript(_SCHEMA)
-                candidate_store._validate_database(connection)
-                verification, _, _ = candidate_store._verify_connection(connection)
-                if not verification.valid:
-                    raise LedgerReadError(self._verification_error(verification))
+                    if not existed_before and not has_schema:
+                        for statement in _SCHEMA_STATEMENTS:
+                            connection.execute(statement)
 
-            try:
-                os.link(candidate, self.path)
-            except FileExistsError:
-                self._validate_existing_ledger()
-                return
-            except OSError as exc:
-                raise LedgerReadError(
-                    f"unable to install new ledger atomically: {exc}"
-                ) from exc
-
-            self._validate_existing_ledger()
+                    self._validate_database(connection)
+                    verification, _, _ = self._verify_connection(connection)
+                    if not verification.valid:
+                        raise LedgerReadError(self._verification_error(verification))
+                    connection.execute("COMMIT")
+                except Exception:
+                    if connection.in_transaction:
+                        connection.execute("ROLLBACK")
+                    raise
         except LedgerReadError:
             raise
         except (OSError, sqlite3.Error) as exc:
             raise LedgerReadError(f"unable to initialize ledger: {exc}") from exc
-        finally:
-            if candidate is not None:
-                try:
-                    candidate.unlink(missing_ok=True)
-                except OSError:
-                    pass
 
     def append(self, draft: EventDraft) -> LedgerEvent:
         try:
@@ -528,6 +517,20 @@ class SQLiteEventStore:
                 raise LedgerReadError(
                     f"Sayf ledger schema object {key[1]} is missing or malformed"
                 )
+
+    @staticmethod
+    def _has_user_schema_objects(connection: sqlite3.Connection) -> bool:
+        return (
+            connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE name NOT LIKE 'sqlite_%'
+                  AND type IN ('table', 'index', 'trigger', 'view')
+                LIMIT 1
+                """
+            ).fetchone()
+            is not None
+        )
 
     @staticmethod
     def _required_text(row: sqlite3.Row, column: str) -> str:
