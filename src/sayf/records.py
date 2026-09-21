@@ -295,8 +295,8 @@ class ReleasePayload(BaseModel):
     release_ref: str = Field(min_length=1)
     subject: RecordBinding
     gate_decision: RecordBinding
-    subject_effective_state_hash: str
-    gate_decision_status_hash: str
+    authority_fingerprint_version: Literal[1] = 1
+    authority_fingerprint: str
     environment: dict[str, Any] = Field(min_length=1)
 
     @field_validator("release_ref")
@@ -304,12 +304,14 @@ class ReleasePayload(BaseModel):
     def normalize_release_ref(cls, value: str) -> str:
         return _normalize_text(value, "release ref")
 
-    @field_validator("subject_effective_state_hash", "gate_decision_status_hash")
+    @field_validator("authority_fingerprint")
     @classmethod
-    def validate_hash(cls, value: str) -> str:
-        value = _normalize_text(value, "release authority hash")
+    def validate_authority_fingerprint(cls, value: str) -> str:
+        value = _normalize_text(value, "release authority fingerprint")
         if not _SHA256_RE.fullmatch(value):
-            raise ValueError("release authority hashes must be lowercase sha256:<64 hex>")
+            raise ValueError(
+                "release authority fingerprint must be lowercase sha256:<64 hex>"
+            )
         return value
 
     @field_validator("environment", mode="before")
