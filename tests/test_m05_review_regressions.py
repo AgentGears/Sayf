@@ -253,9 +253,9 @@ def test_feedback_application_recovers_compatible_concurrent_progress(
     open_feedback(repo)
 
     original_create_relation = repo.create_relation
-    original_invalidate = repo.invalidate
+    original_qualify = repo._qualify_feedback_invalidation
     create_injected = False
-    invalidate_injected = False
+    qualification_injected = False
 
     def competing_create(draft: RelationDraft, *, actor: Actor):
         nonlocal create_injected
@@ -265,21 +265,21 @@ def test_feedback_application_recovers_compatible_concurrent_progress(
             raise LedgerReadError("simulated competing relation commit")
         return original_create_relation(draft, actor=actor)
 
-    def competing_invalidate(relation_id: str, *, actor: Actor):
-        nonlocal invalidate_injected
-        if not invalidate_injected:
-            invalidate_injected = True
-            original_invalidate(relation_id, actor=actor)
+    def competing_qualify(case_id: str, *, actor: Actor):
+        nonlocal qualification_injected
+        if not qualification_injected:
+            qualification_injected = True
+            original_qualify(case_id, actor=actor)
             raise LedgerReadError("simulated competing qualification commit")
-        return original_invalidate(relation_id, actor=actor)
+        return original_qualify(case_id, actor=actor)
 
     monkeypatch.setattr(repo, "create_relation", competing_create)
-    monkeypatch.setattr(repo, "invalidate", competing_invalidate)
+    monkeypatch.setattr(repo, "_qualify_feedback_invalidation", competing_qualify)
 
     status = repo.apply_feedback("feedback1", actor=ACTOR)
 
     assert create_injected is True
-    assert invalidate_injected is True
+    assert qualification_injected is True
     assert status.state is FeedbackApplicationState.APPLIED
     assert repo.effective_state().state("assumption1").validity.value == "invalidated"
 
