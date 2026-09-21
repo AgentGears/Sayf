@@ -47,12 +47,14 @@ from sayf.state import (
     ValidityState,
 )
 
+RELEASE_AUTHORITY_FINGERPRINT_VERSION = 1
+
 
 class M05ProjectionError(GateProjectionError):
     """Raised when M0.5 release/feedback history cannot be projected safely."""
 
 
-class ReleaseFreshness(StrEnum):
+class ReleaseAuthorityFreshness(StrEnum):
     FRESH = "fresh"
     STALE = "stale"
 
@@ -158,8 +160,8 @@ class ReleaseStatus(BaseModel):
     release_ref: str
     subject_id: str
     gate_decision_id: str
-    freshness: ReleaseFreshness
-    stale_input_record_ids: tuple[str, ...] = ()
+    authority_freshness: ReleaseAuthorityFreshness
+    stale_authority_record_ids: tuple[str, ...] = ()
 
 
 class FeedbackApplicationStatus(BaseModel):
@@ -210,8 +212,16 @@ def _sha256(value: Any) -> str:
     return f"{HASH_PREFIX}{digest}"
 
 
-def gate_status_hash(status: GateDecisionStatus) -> str:
-    return _sha256(status.model_dump(mode="json"))
+def release_authority_fingerprint(status: GateDecisionStatus) -> str:
+    """Hash only the stable v1 gate-authority facts required by a Release."""
+    return _sha256(
+        {
+            "schema_version": RELEASE_AUTHORITY_FINGERPRINT_VERSION,
+            "decision_id": status.decision_id,
+            "outcome": status.outcome.value,
+            "freshness": status.freshness.value,
+        }
+    )
 
 
 def _is_usable_state(state: Any) -> bool:
@@ -277,10 +287,51 @@ def _feedback_payload(record: Record) -> FeedbackCasePayload:
         ) from exc
 
 
+def _gate_status_for_state(
+    graph: CausalGraph,
+    state: EffectiveStateProjection,
+    decision_id: str,
+) -> GateDecisionStatus:
+    """Derive one decision status from an already-validated gate record and state."""
+    decision = graph.record(decision_id)
+    if decision.type is not RecordType.GATE_DECISION:
+        raise M05ProjectionError(f"record {decision_id} is not a GateDecision")
+    payload = GateDecisionPayload.model_validate(decision.payload)
+    stale_input_ids: list[str] = []
+
+    decision_state = state.state(decision.id)
+    if not _is_usable_state(decision_state):
+        stale_input_ids.append(decision.id)
+
+    for expected_input in payload.evaluated_inputs:
+        current_record = graph.record(expected_input.record_id)
+        current_state = state.state(expected_input.record_id)
+        if (
+            current_record.content_hash != expected_input.content_hash
+            or effective_state_hash(current_state) != expected_input.effective_state_hash
+        ):
+            stale_input_ids.append(expected_input.record_id)
+
+    return GateDecisionStatus(
+        decision_id=decision.id,
+        gate_request_id=payload.gate_request.record_id,
+        outcome=payload.outcome,
+        freshness=(
+            GateDecisionFreshness.STALE
+            if stale_input_ids
+            else GateDecisionFreshness.FRESH
+        ),
+        stale_input_record_ids=tuple(stale_input_ids),
+        reasons=payload.reasons,
+        satisfied_requirements=payload.satisfied_requirements,
+        missing_requirements=payload.missing_requirements,
+    )
+
+
 def build_release_payload(
     graph: CausalGraph,
     state: EffectiveStateProjection,
-    gates: GateProjection,
+    gate_status: GateDecisionStatus,
     spec: ReleaseSpec,
 ) -> ReleasePayload:
     subject = graph.record(spec.subject_id)
@@ -293,12 +344,15 @@ def build_release_payload(
         raise M05ProjectionError(
             f"release gate {decision.id} must have type GateDecision, found {decision.type.value}"
         )
+    if gate_status.decision_id != decision.id:
+        raise M05ProjectionError(
+            f"gate status {gate_status.decision_id} does not describe release gate {decision.id}"
+        )
     decision_payload = GateDecisionPayload.model_validate(decision.payload)
     if decision_payload.subject != record_binding(subject):
         raise M05ProjectionError(
             f"gate decision {decision.id} does not authorize release subject {subject.id}"
         )
-    gate_status = gates.status(decision.id)
     if gate_status.outcome is not GateOutcome.PERMIT:
         raise M05ProjectionError(
             f"gate decision {decision.id} is {gate_status.outcome.value}, not permit"
@@ -312,8 +366,8 @@ def build_release_payload(
         release_ref=spec.release_ref,
         subject=record_binding(subject),
         gate_decision=record_binding(decision),
-        subject_effective_state_hash=effective_state_hash(subject_state),
-        gate_decision_status_hash=gate_status_hash(gate_status),
+        authority_fingerprint_version=RELEASE_AUTHORITY_FINGERPRINT_VERSION,
+        authority_fingerprint=release_authority_fingerprint(gate_status),
         environment=spec.environment,
     )
 
@@ -450,11 +504,30 @@ class M05Projection:
                             f"release {seen_release_refs[actual.release_ref]}"
                         )
                     prefix = event_list[: record.created_sequence - 1]
-                    prefix_gates = GateProjection.from_events(prefix)
+                    prefix_state = EffectiveStateProjection.from_events(prefix)
+                    _resolve_binding(
+                        prefix_state.graph,
+                        actual.subject,
+                        expected_type=RecordType.CHANGE_SET,
+                        before_sequence=record.created_sequence,
+                        role=f"release {record.id} subject",
+                    )
+                    decision = _resolve_binding(
+                        prefix_state.graph,
+                        actual.gate_decision,
+                        expected_type=RecordType.GATE_DECISION,
+                        before_sequence=record.created_sequence,
+                        role=f"release {record.id} gate decision",
+                    )
+                    prefix_gate_status = _gate_status_for_state(
+                        prefix_state.graph,
+                        prefix_state,
+                        decision.id,
+                    )
                     expected = build_release_payload(
-                        prefix_gates.graph,
-                        prefix_gates.state_projection,
-                        prefix_gates,
+                        prefix_state.graph,
+                        prefix_state,
+                        prefix_gate_status,
                         ReleaseSpec(
                             release_ref=actual.release_ref,
                             subject_id=actual.subject.record_id,
@@ -516,21 +589,21 @@ class M05Projection:
             release_state = gates.state_projection.state(record.id)
             if not _is_usable_state(release_state):
                 stale_ids.append(record.id)
-            subject_state = gates.state_projection.state(payload.subject.record_id)
-            if effective_state_hash(subject_state) != payload.subject_effective_state_hash:
-                stale_ids.append(payload.subject.record_id)
             gate_status = gates.status(payload.gate_decision.record_id)
-            if gate_status_hash(gate_status) != payload.gate_decision_status_hash:
+            if release_authority_fingerprint(gate_status) != payload.authority_fingerprint:
+                stale_ids.extend(gate_status.stale_input_record_ids)
                 stale_ids.append(payload.gate_decision.record_id)
             release_statuses[record.id] = ReleaseStatus(
                 release_id=record.id,
                 release_ref=payload.release_ref,
                 subject_id=payload.subject.record_id,
                 gate_decision_id=payload.gate_decision.record_id,
-                freshness=(
-                    ReleaseFreshness.STALE if stale_ids else ReleaseFreshness.FRESH
+                authority_freshness=(
+                    ReleaseAuthorityFreshness.STALE
+                    if stale_ids
+                    else ReleaseAuthorityFreshness.FRESH
                 ),
-                stale_input_record_ids=tuple(dict.fromkeys(stale_ids)),
+                stale_authority_record_ids=tuple(dict.fromkeys(stale_ids)),
             )
 
         explain_edges = cls._derive_explain_edges(event_list, gates)
@@ -788,12 +861,46 @@ class M05Projection:
             invalidation_event_id=target_state.invalidation_event_ids[index],
         )
 
+    def validate_feedback_application_eligibility(self, case_id: str) -> None:
+        """Require all source evidence for new feedback authority to remain usable."""
+        case = self._graph.record(case_id)
+        if case.type is not RecordType.FEEDBACK_CASE:
+            raise M05ProjectionError(f"record {case_id} is not a FeedbackCase")
+        payload = _feedback_payload(case)
+        observation = _resolve_binding(
+            self._graph,
+            payload.observation,
+            expected_type=RecordType.RUNTIME_OBSERVATION,
+            before_sequence=case.created_sequence,
+            role=f"feedback case {case.id} observation",
+        )
+        runtime = _runtime_payload(observation)
+
+        source_ids = [case.id, observation.id]
+        source_ids.extend(binding.record_id for binding in runtime.evidence)
+        unusable = [
+            record_id
+            for record_id in source_ids
+            if not _is_usable_state(self._state.state(record_id))
+        ]
+        if unusable:
+            raise M05ProjectionError(
+                f"feedback case {case.id} cannot create invalidation authority because "
+                "source records are not usable: " + ", ".join(unusable)
+            )
+
     @staticmethod
-    def _validate_query_bounds(max_depth: int, max_results: int) -> None:
+    def _validate_query_bounds(
+        max_depth: int,
+        max_results: int,
+        max_expansions: int,
+    ) -> None:
         if not 0 <= max_depth <= 32:
             raise ValueError("max_depth must be between 0 and 32")
         if not 1 <= max_results <= 1000:
             raise ValueError("max_results must be between 1 and 1000")
+        if not 1 <= max_expansions <= 100_000:
+            raise ValueError("max_expansions must be between 1 and 100000")
 
     def _walk(
         self,
@@ -802,24 +909,31 @@ class M05Projection:
         reverse: bool,
         max_depth: int,
         max_results: int,
+        max_expansions: int,
     ) -> tuple[ExplanationPath, ...]:
-        self._validate_query_bounds(max_depth, max_results)
+        self._validate_query_bounds(max_depth, max_results, max_expansions)
         self._graph.record(record_id)
         if max_depth == 0:
             return ()
         adjacency = self._incoming if reverse else self._outgoing
-        queue: deque[tuple[str, tuple[ExplainEdge, ...]]] = deque([(record_id, ())])
-        visited = {record_id}
+        queue: deque[
+            tuple[str, tuple[ExplainEdge, ...], frozenset[str]]
+        ] = deque([(record_id, (), frozenset({record_id}))])
         result: list[ExplanationPath] = []
+        expansions = 0
         while queue:
-            current_id, path = queue.popleft()
+            current_id, path, path_record_ids = queue.popleft()
             if len(path) >= max_depth:
                 continue
             for edge in adjacency.get(current_id, ()):
+                expansions += 1
+                if expansions > max_expansions:
+                    raise M05ProjectionError(
+                        "explainability query exceeded the configured expansion bound"
+                    )
                 next_id = edge.source_id if reverse else edge.target_id
-                if next_id in visited:
+                if next_id in path_record_ids:
                     continue
-                visited.add(next_id)
                 next_path = (*path, edge)
                 result.append(
                     ExplanationPath(
@@ -832,7 +946,9 @@ class M05Projection:
                     raise M05ProjectionError(
                         "explainability query exceeded the configured result bound"
                     )
-                queue.append((next_id, next_path))
+                queue.append(
+                    (next_id, next_path, path_record_ids | frozenset({next_id}))
+                )
         return tuple(result)
 
     def why(
@@ -841,13 +957,15 @@ class M05Projection:
         *,
         max_depth: int = 8,
         max_results: int = 100,
+        max_expansions: int = 10_000,
     ) -> tuple[ExplanationPath, ...]:
-        """Return canonical shortest upstream explanation paths for a record."""
+        """Return bounded deterministic recorded relationship paths upstream."""
         return self._walk(
             record_id,
             reverse=False,
             max_depth=max_depth,
             max_results=max_results,
+            max_expansions=max_expansions,
         )
 
     def impact(
@@ -856,13 +974,15 @@ class M05Projection:
         *,
         max_depth: int = 8,
         max_results: int = 100,
+        max_expansions: int = 10_000,
     ) -> tuple[ExplanationPath, ...]:
-        """Return canonical shortest downstream impact paths from a record."""
+        """Return bounded deterministic recorded relationship paths downstream."""
         return self._walk(
             record_id,
             reverse=True,
             max_depth=max_depth,
             max_results=max_results,
+            max_expansions=max_expansions,
         )
 
     def timeline(self, record_id: str, *, max_entries: int = 200) -> tuple[TimelineEntry, ...]:
