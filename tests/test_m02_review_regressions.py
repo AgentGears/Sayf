@@ -119,7 +119,7 @@ def test_contract_bearing_record_types_are_reserved(record_type: RecordType) -> 
         RecordDraft(record_id="rec_reserved", record_type=record_type)
 
 
-def test_privileged_reserved_contract_event_poisoning_fails_projection_closed() -> None:
+def test_privileged_malformed_activated_contract_event_poisoning_fails_projection_closed() -> None:
     event = LedgerEvent(
         event_id="rec_gate",
         sequence=1,
@@ -137,7 +137,7 @@ def test_privileged_reserved_contract_event_poisoning_fails_projection_closed() 
         event_hash="sha256:" + "1" * 64,
     )
 
-    with pytest.raises(GraphProjectionError, match="reserved until its semantic contract"):
+    with pytest.raises(GraphProjectionError, match="invalid typed event"):
         CausalGraph.from_events([event])
 
 

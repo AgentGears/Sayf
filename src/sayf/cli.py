@@ -10,6 +10,7 @@ from pydantic import BaseModel, ValidationError
 from sayf.artifacts import ArtifactStoreError
 from sayf.causal import CausalRepository
 from sayf.domain import Actor, ActorKind, EventDraft
+from sayf.gates import GateRequestSpec, PolicySnapshotSpec, VerificationReceiptSpec
 from sayf.graph import GraphDirection, GraphProjectionError
 from sayf.records import (
     RECORD_CREATED_EVENT_TYPE,
@@ -28,12 +29,18 @@ record_app = typer.Typer(help="Create and inspect immutable typed records.")
 relation_app = typer.Typer(help="Create immutable typed relations.")
 graph_app = typer.Typer(help="Traverse the deterministic typed-record graph.")
 state_app = typer.Typer(help="Qualify and inspect revision/staleness state.")
+verification_app = typer.Typer(help="Record bounded verification evidence.")
+policy_app = typer.Typer(help="Register immutable deterministic gate policies.")
+gate_app = typer.Typer(help="Request, evaluate, and inspect deterministic gates.")
 artifact_app = typer.Typer(help="Register and verify content-addressed artifacts.")
 app.add_typer(ledger_app, name="ledger")
 app.add_typer(record_app, name="record")
 app.add_typer(relation_app, name="relation")
 app.add_typer(graph_app, name="graph")
 app.add_typer(state_app, name="state")
+app.add_typer(verification_app, name="verification")
+app.add_typer(policy_app, name="policy")
+app.add_typer(gate_app, name="gate")
 app.add_typer(artifact_app, name="artifact")
 
 DEFAULT_DB = Path(".sayf/ledger.sqlite3")
@@ -374,6 +381,123 @@ def show_affected_records(
     except (LedgerReadError, GraphProjectionError) as exc:
         _domain_error(exc)
     _echo_models(states)
+
+
+@verification_app.command("record")
+def record_verification(
+    payload: Annotated[str, typer.Option("--payload", help="Verification specification JSON.")],
+    record_id: Annotated[str | None, typer.Option("--id")] = None,
+    actor_kind: Annotated[ActorKind, typer.Option("--actor-kind")] = ActorKind.TOOL,
+    actor_id: Annotated[str, typer.Option("--actor-id")] = "local-verifier",
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        spec = VerificationReceiptSpec.model_validate(_parse_payload(payload))
+    except ValidationError as exc:
+        raise typer.BadParameter(f"verification specification is invalid: {exc}") from exc
+    try:
+        record = _repository(db, objects).record_verification(
+            spec,
+            actor=_actor(actor_kind, actor_id),
+            record_id=record_id,
+        )
+    except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
+        _domain_error(exc)
+    _echo_model(record)
+
+
+@policy_app.command("register")
+def register_policy(
+    payload: Annotated[str, typer.Option("--payload", help="Policy snapshot specification JSON.")],
+    record_id: Annotated[str | None, typer.Option("--id")] = None,
+    actor_kind: Annotated[ActorKind, typer.Option("--actor-kind")] = ActorKind.HUMAN,
+    actor_id: Annotated[str, typer.Option("--actor-id")] = "local-user",
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        spec = PolicySnapshotSpec.model_validate(_parse_payload(payload))
+    except ValidationError as exc:
+        raise typer.BadParameter(f"policy snapshot specification is invalid: {exc}") from exc
+    try:
+        record = _repository(db, objects).register_policy_snapshot(
+            spec,
+            actor=_actor(actor_kind, actor_id),
+            record_id=record_id,
+        )
+    except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
+        _domain_error(exc)
+    _echo_model(record)
+
+
+@gate_app.command("request")
+def request_gate(
+    payload: Annotated[str, typer.Option("--payload", help="Gate request specification JSON.")],
+    record_id: Annotated[str | None, typer.Option("--id")] = None,
+    actor_kind: Annotated[ActorKind, typer.Option("--actor-kind")] = ActorKind.HUMAN,
+    actor_id: Annotated[str, typer.Option("--actor-id")] = "local-user",
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        spec = GateRequestSpec.model_validate(_parse_payload(payload))
+    except ValidationError as exc:
+        raise typer.BadParameter(f"gate request specification is invalid: {exc}") from exc
+    try:
+        record = _repository(db, objects).request_gate(
+            spec,
+            actor=_actor(actor_kind, actor_id),
+            record_id=record_id,
+        )
+    except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
+        _domain_error(exc)
+    _echo_model(record)
+
+
+@gate_app.command("evaluate")
+def evaluate_gate(
+    request_id: Annotated[str, typer.Argument()],
+    record_id: Annotated[str | None, typer.Option("--id")] = None,
+    actor_kind: Annotated[ActorKind, typer.Option("--actor-kind")] = ActorKind.POLICY_ENGINE,
+    actor_id: Annotated[str, typer.Option("--actor-id")] = "local-policy-engine",
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        record = _repository(db, objects).evaluate_gate(
+            request_id,
+            actor=_actor(actor_kind, actor_id),
+            record_id=record_id,
+        )
+    except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
+        _domain_error(exc)
+    _echo_model(record)
+
+
+@gate_app.command("show")
+def show_gate_decision(
+    decision_id: Annotated[str, typer.Argument()],
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        status = _repository(db, objects).gate_status(decision_id)
+    except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
+        _domain_error(exc)
+    _echo_model(status)
+
+
+@gate_app.command("list")
+def list_gate_decisions(
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        decisions = _repository(db, objects).gates().decisions
+    except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
+        _domain_error(exc)
+    _echo_models(decisions)
 
 
 @artifact_app.command("put")
