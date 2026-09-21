@@ -295,10 +295,11 @@ class CausalRepository:
         self.event_store.initialize()
         projection, expected_event_count, expected_head_hash = self._m05_snapshot()
         projection.validate_release_ref_available(snapshot.release_ref)
+        gate_status = projection.gate_projection.status(snapshot.gate_decision_id)
         payload = build_release_payload(
             projection.graph,
             projection.state_projection,
-            projection.gate_projection,
+            gate_status,
             snapshot,
         )
         return self._append_semantic_record(
@@ -360,22 +361,49 @@ class CausalRepository:
         return self.feedback().feedback_application_status(case_id)
 
     def apply_feedback(self, case_id: str, *, actor: Actor) -> FeedbackApplicationStatus:
+        """Apply one feedback invalidation with crash-safe and concurrency-safe retries."""
         self.event_store.initialize()
-        projection, _, _ = self._m05_snapshot()
-        status = projection.feedback_application_status(case_id)
-        if status.state is FeedbackApplicationState.APPLIED:
-            return status
-        case_record = projection.graph.record(case_id)
-        draft = feedback_invalidation_relation_draft(case_record)
-        if status.state is FeedbackApplicationState.NOT_APPLIED:
-            self.create_relation(draft, actor=actor)
+        last_error: Exception | None = None
 
-        projection, _, _ = self._m05_snapshot()
-        status = projection.feedback_application_status(case_id)
-        if status.state is FeedbackApplicationState.APPLIED:
-            return status
-        self.invalidate(status.relation_id, actor=actor)
-        return self.feedback().feedback_application_status(case_id)
+        for _ in range(4):
+            projection, _, _ = self._m05_snapshot()
+            status = projection.feedback_application_status(case_id)
+            if status.state is FeedbackApplicationState.APPLIED:
+                return status
+
+            projection.validate_feedback_application_eligibility(case_id)
+            case_record = projection.graph.record(case_id)
+            draft = feedback_invalidation_relation_draft(case_record)
+
+            if status.state is FeedbackApplicationState.NOT_APPLIED:
+                try:
+                    self.create_relation(draft, actor=actor)
+                except (LedgerReadError, GraphProjectionError) as exc:
+                    last_error = exc
+                    latest = self.feedback().feedback_application_status(case_id)
+                    if latest.state is FeedbackApplicationState.NOT_APPLIED:
+                        raise
+                continue
+
+            # A pending deterministic relation is inert until this qualification.
+            # Eligibility is revalidated on every loop immediately before authority.
+            try:
+                self.invalidate(status.relation_id, actor=actor)
+            except (LedgerReadError, GraphProjectionError) as exc:
+                last_error = exc
+                latest = self.feedback().feedback_application_status(case_id)
+                if latest.state is FeedbackApplicationState.APPLIED:
+                    return latest
+                if latest.state is FeedbackApplicationState.PENDING_QUALIFICATION:
+                    raise
+                continue
+            return self.feedback().feedback_application_status(case_id)
+
+        if last_error is not None:
+            raise LedgerReadError(
+                "feedback application did not converge after concurrent ledger changes"
+            ) from last_error
+        raise LedgerReadError("feedback application did not converge")
 
     def why(
         self,
@@ -383,11 +411,13 @@ class CausalRepository:
         *,
         max_depth: int = 8,
         max_results: int = 100,
+        max_expansions: int = 10_000,
     ) -> tuple[ExplanationPath, ...]:
         return self.feedback().why(
             record_id,
             max_depth=max_depth,
             max_results=max_results,
+            max_expansions=max_expansions,
         )
 
     def impact(
@@ -396,11 +426,13 @@ class CausalRepository:
         *,
         max_depth: int = 8,
         max_results: int = 100,
+        max_expansions: int = 10_000,
     ) -> tuple[ExplanationPath, ...]:
         return self.feedback().impact(
             record_id,
             max_depth=max_depth,
             max_results=max_results,
+            max_expansions=max_expansions,
         )
 
     def timeline(self, record_id: str, *, max_entries: int = 200) -> tuple[TimelineEntry, ...]:
