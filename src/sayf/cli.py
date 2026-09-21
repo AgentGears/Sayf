@@ -633,6 +633,7 @@ def explain_why(
     record_id: Annotated[str, typer.Argument()],
     max_depth: Annotated[int, typer.Option("--max-depth")] = 8,
     max_results: Annotated[int, typer.Option("--max-results")] = 100,
+    max_expansions: Annotated[int, typer.Option("--max-expansions")] = 10_000,
     db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
     objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
 ) -> None:
@@ -641,6 +642,7 @@ def explain_why(
             record_id,
             max_depth=max_depth,
             max_results=max_results,
+            max_expansions=max_expansions,
         )
     except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
         _domain_error(exc)
@@ -652,6 +654,7 @@ def explain_impact(
     record_id: Annotated[str, typer.Argument()],
     max_depth: Annotated[int, typer.Option("--max-depth")] = 8,
     max_results: Annotated[int, typer.Option("--max-results")] = 100,
+    max_expansions: Annotated[int, typer.Option("--max-expansions")] = 10_000,
     db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
     objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
 ) -> None:
@@ -660,6 +663,7 @@ def explain_impact(
             record_id,
             max_depth=max_depth,
             max_results=max_results,
+            max_expansions=max_expansions,
         )
     except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
         _domain_error(exc)
