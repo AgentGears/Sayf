@@ -930,7 +930,7 @@ class M05Projection:
         payload = _feedback_payload(case)
         relation_id = feedback_invalidation_relation_id(case.id)
         try:
-            relation = self._graph.relation(relation_id)
+            self._graph.relation(relation_id)
         except GraphProjectionError:
             return FeedbackApplicationStatus(
                 case_id=case.id,
