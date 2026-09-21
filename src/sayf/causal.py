@@ -8,7 +8,6 @@ from pydantic import BaseModel
 from sayf.artifacts import ArtifactVerification, ContentAddressedArtifactStore
 from sayf.domain import Actor, EventDraft, LedgerEvent
 from sayf.feedback import (
-    ExplainEdge,
     ExplanationPath,
     FeedbackApplicationState,
     FeedbackApplicationStatus,
