@@ -361,6 +361,7 @@ def _evaluation_input_records(
         ),
     ]
     seen = {record.id for record in ordered}
+    receipts: list[tuple[Record, VerificationReceiptPayload]] = []
 
     for binding in request.verification_receipts:
         receipt = _resolve_binding(
@@ -370,10 +371,14 @@ def _evaluation_input_records(
             before_sequence=request_record.created_sequence,
             role=f"gate request {request_record.id} receipt",
         )
+        payload = _receipt_payload(receipt)
+        receipts.append((receipt, payload))
         if receipt.id not in seen:
             ordered.append(receipt)
             seen.add(receipt.id)
-        for evidence_binding in _receipt_payload(receipt).evidence:
+
+    for receipt, payload in receipts:
+        for evidence_binding in payload.evidence:
             evidence = _resolve_binding(
                 graph,
                 evidence_binding,
