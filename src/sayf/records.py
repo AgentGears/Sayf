@@ -59,17 +59,20 @@ M04_SEMANTIC_RECORD_TYPES = frozenset(
     }
 )
 
-# Contracts that remain intentionally unavailable after M0.4. Persisting one through
-# the generic record surface would freeze authoritative-looking state before its
-# milestone defines the payload and authority semantics.
-RESERVED_CONTRACT_RECORD_TYPES = frozenset(
+M05_SEMANTIC_RECORD_TYPES = frozenset(
     {
-        RecordType.RISK_ASSESSMENT,
         RecordType.RELEASE,
         RecordType.RUNTIME_OBSERVATION,
         RecordType.FEEDBACK_CASE,
     }
 )
+
+SEMANTIC_RECORD_TYPES = M04_SEMANTIC_RECORD_TYPES | M05_SEMANTIC_RECORD_TYPES
+
+# RiskAssessment remains intentionally unavailable after M0.5. Persisting one through
+# the generic record surface would freeze authoritative-looking state before its
+# contract and policy semantics are defined.
+RESERVED_CONTRACT_RECORD_TYPES = frozenset({RecordType.RISK_ASSESSMENT})
 
 
 class VerificationResult(StrEnum):
@@ -89,6 +92,26 @@ class VerificationIndependence(StrEnum):
 class GateOutcome(StrEnum):
     PERMIT = "permit"
     BLOCK = "block"
+
+
+class RuntimeOutcome(StrEnum):
+    NOMINAL = "nominal"
+    DEGRADED = "degraded"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+class FeedbackClassification(StrEnum):
+    FALSIFIES = "falsifies"
+    CONTRADICTS = "contradicts"
+    VIOLATES = "violates"
+    ANOMALY = "anomaly"
+    INFORMATIONAL = "informational"
+
+
+class FeedbackEffect(StrEnum):
+    NONE = "none"
+    INVALIDATE_TARGET = "invalidate_target"
 
 
 class RecordBinding(BaseModel):
@@ -266,16 +289,104 @@ class GateDecisionPayload(BaseModel):
         return self
 
 
-_M04_PAYLOAD_MODELS: dict[RecordType, type[BaseModel]] = {
+class ReleasePayload(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    release_ref: str = Field(min_length=1)
+    subject: RecordBinding
+    gate_decision: RecordBinding
+    subject_effective_state_hash: str
+    gate_decision_status_hash: str
+    environment: dict[str, Any] = Field(min_length=1)
+
+    @field_validator("release_ref")
+    @classmethod
+    def normalize_release_ref(cls, value: str) -> str:
+        return _normalize_text(value, "release ref")
+
+    @field_validator("subject_effective_state_hash", "gate_decision_status_hash")
+    @classmethod
+    def validate_hash(cls, value: str) -> str:
+        value = _normalize_text(value, "release authority hash")
+        if not _SHA256_RE.fullmatch(value):
+            raise ValueError("release authority hashes must be lowercase sha256:<64 hex>")
+        return value
+
+    @field_validator("environment", mode="before")
+    @classmethod
+    def normalize_environment(cls, value: Any) -> dict[str, Any]:
+        return _normalize_json_object(value, "release environment")
+
+
+class RuntimeObservationPayload(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    release: RecordBinding
+    outcome: RuntimeOutcome
+    summary: str = Field(min_length=1)
+    environment: dict[str, Any] = Field(min_length=1)
+    evidence: tuple[RecordBinding, ...] = ()
+
+    @field_validator("summary")
+    @classmethod
+    def normalize_summary(cls, value: str) -> str:
+        return _normalize_text(value, "runtime observation summary")
+
+    @field_validator("environment", mode="before")
+    @classmethod
+    def normalize_environment(cls, value: Any) -> dict[str, Any]:
+        return _normalize_json_object(value, "runtime observation environment")
+
+    @model_validator(mode="after")
+    def validate_unique_evidence(self) -> RuntimeObservationPayload:
+        ids = [binding.record_id for binding in self.evidence]
+        if len(ids) != len(set(ids)):
+            raise ValueError("runtime observation evidence must be unique by record id")
+        return self
+
+
+class FeedbackCasePayload(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    observation: RecordBinding
+    target: RecordBinding
+    classification: FeedbackClassification
+    proposed_effect: FeedbackEffect = FeedbackEffect.NONE
+    rationale: str = Field(min_length=1)
+
+    @field_validator("rationale")
+    @classmethod
+    def normalize_rationale(cls, value: str) -> str:
+        return _normalize_text(value, "feedback rationale")
+
+    @model_validator(mode="after")
+    def validate_effect(self) -> FeedbackCasePayload:
+        if self.proposed_effect is FeedbackEffect.INVALIDATE_TARGET:
+            if self.classification not in {
+                FeedbackClassification.FALSIFIES,
+                FeedbackClassification.CONTRADICTS,
+                FeedbackClassification.VIOLATES,
+            }:
+                raise ValueError(
+                    "target invalidation requires falsifies, contradicts, or violates "
+                    "classification"
+                )
+        return self
+
+
+_SEMANTIC_PAYLOAD_MODELS: dict[RecordType, type[BaseModel]] = {
     RecordType.VERIFICATION_RECEIPT: VerificationReceiptPayload,
     RecordType.POLICY_SNAPSHOT: PolicySnapshotPayload,
     RecordType.GATE_REQUEST: GateRequestPayload,
     RecordType.GATE_DECISION: GateDecisionPayload,
+    RecordType.RELEASE: ReleasePayload,
+    RecordType.RUNTIME_OBSERVATION: RuntimeObservationPayload,
+    RecordType.FEEDBACK_CASE: FeedbackCasePayload,
 }
 
 
 def _validate_semantic_payload(record_type: RecordType, payload: dict[str, Any]) -> dict[str, Any]:
-    model_type = _M04_PAYLOAD_MODELS.get(record_type)
+    model_type = _SEMANTIC_PAYLOAD_MODELS.get(record_type)
     if model_type is None:
         return payload
     return model_type.model_validate(payload).model_dump(mode="json")
@@ -294,6 +405,11 @@ def _ensure_generic_record_creation_allowed(record_type: RecordType) -> None:
     if record_type in M04_SEMANTIC_RECORD_TYPES:
         raise ValueError(
             f"record type {record_type.value} must be created through its M0.4 "
+            "semantic API"
+        )
+    if record_type in M05_SEMANTIC_RECORD_TYPES:
+        raise ValueError(
+            f"record type {record_type.value} must be created through its M0.5 "
             "semantic API"
         )
 
@@ -432,7 +548,7 @@ class RecordCreatedPayload(BaseModel):
         _ensure_record_type_contract_implemented(self.record_type)
         if self.record_type is RecordType.ARTIFACT:
             ArtifactDescriptor.model_validate(self.payload)
-        elif self.record_type in M04_SEMANTIC_RECORD_TYPES:
+        elif self.record_type in SEMANTIC_RECORD_TYPES:
             _validate_semantic_payload(self.record_type, self.payload)
         return self
 
@@ -551,8 +667,8 @@ def semantic_record_event_payload(
     record_type: RecordType,
     payload: BaseModel | dict[str, Any],
 ) -> dict[str, Any]:
-    if record_type not in M04_SEMANTIC_RECORD_TYPES:
-        raise ValueError(f"record type {record_type.value} is not an M0.4 semantic record")
+    if record_type not in SEMANTIC_RECORD_TYPES:
+        raise ValueError(f"record type {record_type.value} is not a semantic record")
     payload_value = (
         payload.model_dump(mode="json")
         if isinstance(payload, BaseModel)
@@ -593,7 +709,7 @@ def record_from_event(event: LedgerEvent) -> Record:
     payload = RecordCreatedPayload.model_validate(event.payload)
     normalized_payload = (
         _validate_semantic_payload(payload.record_type, payload.payload)
-        if payload.record_type in M04_SEMANTIC_RECORD_TYPES
+        if payload.record_type in SEMANTIC_RECORD_TYPES
         else payload.payload
     )
     expected_hash = _content_hash(
