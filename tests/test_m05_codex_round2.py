@@ -33,7 +33,6 @@ from sayf.records import (
     VerificationResult,
 )
 from sayf.state import RECORD_INVALIDATED_EVENT_TYPE, semantic_relation_event_payload
-from sayf.storage import LedgerReadError
 
 ACTOR = Actor(kind=ActorKind.HUMAN, id="m05-codex-round2")
 VERIFIER = Actor(kind=ActorKind.TOOL, id="m05-verifier")
