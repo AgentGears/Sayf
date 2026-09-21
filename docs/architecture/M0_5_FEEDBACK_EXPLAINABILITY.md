@@ -54,7 +54,7 @@ M0.5 deliberately does **not** collapse evidence, observation, classification, a
 
 - A `RuntimeObservation` is immutable evidence about a historical Release. It has no state authority merely because it records a failure.
 - A `FeedbackCase` is an immutable classification and proposed effect. Opening the case does not mutate effective state.
-- An invalidating feedback case gains state consequence only when its deterministic `invalidates` relation is explicitly qualified through the existing M0.3 state-transition mechanism.
+- An invalidating feedback case gains state consequence only when its deterministic `invalidates` relation is explicitly qualified through the M0.5 managed feedback-application path, which emits the existing M0.3 `sayf.record.invalidated.v1` authority event.
 - `ReleaseAuthorityFreshness.FRESH` means only that the exact Release record remains usable and the bound gate still has the same v1 fresh-PERMIT authority fingerprint captured at release time. It does not mean the deployed system is healthy, correct, safe, available, approved by a human, or still running.
 - A failed runtime observation does not automatically stale a Release. Only an explicit state transition can change M0.3 state and thereby stale downstream authority.
 - Actor IDs, release environment, runtime environment, and feedback rationale are provenance/context. M0.5 does not turn them into authenticated credentials or policy assertions.
@@ -152,17 +152,20 @@ The target may be any prior record in M0.5 v1. That is intentionally an asserted
 
 Opening a FeedbackCase does not mutate state. `apply_feedback(case_id)` is the explicit adoption step for a case that proposes target invalidation.
 
-Application reuses M0.3 instead of introducing another authority store:
+Application reuses the M0.3 authority event rather than introducing another authority store:
 
 1. derive a deterministic `invalidates` relation ID from the FeedbackCase ID;
 2. create the exact relation `FeedbackCase -> target` with metadata binding the exact case content hash;
-3. explicitly qualify that relation with `sayf.record.invalidated.v1`.
+3. use the managed M0.5 qualification path to validate feedback eligibility and M0.3 invalidation semantics against one exact semantic snapshot;
+4. append `sayf.record.invalidated.v1` only if that snapshot's event count and head hash still match under the existing compare-and-append boundary.
 
 The intermediate relation is inert. If the process stops after relation creation but before qualification, replay reports `pending_qualification` rather than pretending invalidation occurred.
 
+The generic `state invalidate` / `CausalRepository.invalidate()` path refuses a managed deterministic feedback relation. This prevents a pending relation from bypassing M0.5 feedback eligibility while preserving the same underlying M0.3 state-event format for authoritative qualification.
+
 ### 6.1 Eligibility for new authority
 
-Immediately before creating or qualifying **new** feedback authority, M0.5 requires all source records to remain usable under M0.3:
+Immediately before qualifying **new** feedback authority, M0.5 requires all source records to remain usable under M0.3:
 
 - the FeedbackCase;
 - its bound RuntimeObservation;
@@ -176,19 +179,24 @@ revision:  current
 freshness: fresh
 ```
 
+Eligibility, M0.3 invalidation validation, and the eventual qualification append are bound to the same semantic snapshot. If any ledger write occurs after validation, the exact-head guard rejects the append and `apply_feedback` replays/revalidates before retrying.
+
 If any source becomes unusable, a not-yet-applied case cannot create new invalidation authority. This rule also applies when the deterministic relation already exists in `pending_qualification` state after an interrupted attempt.
 
-Once qualification has occurred, the application remains historical fact. Later invalidation of the FeedbackCase, observation, or evidence does not erase the already-recorded M0.3 transition.
+Historical replay independently reconstructs the ledger prefix immediately before every managed feedback qualification event and revalidates this eligibility rule. A privileged caller therefore cannot make ineligible feedback authority acceptable merely by appending a syntactically valid M0.3 invalidation event.
+
+Once qualification has occurred validly, the application remains historical fact. Later invalidation of the FeedbackCase, observation, or evidence does not erase the already-recorded M0.3 transition.
 
 ### 6.2 Retry and concurrency semantics
 
-Feedback application is designed to converge for compatible competing callers:
+Feedback application is designed to converge for compatible competing callers and unrelated head movement:
 
 - if another caller creates the same deterministic relation first, the next snapshot recognizes the compatible pending relation and continues;
 - if another caller qualifies the relation first, the next snapshot returns the existing `applied` status;
-- eligibility is revalidated on every retry before qualification;
-- incompatible content at the deterministic relation ID fails closed;
-- unrelated ledger movement still uses the existing semantic-head compare-and-append boundary and requires revalidation.
+- if unrelated ledger movement causes the relation-creation or qualification append to lose the exact-head race, the bounded retry loop takes a new semantic snapshot instead of treating unchanged `not_applied`/`pending_qualification` as a terminal error;
+- eligibility is revalidated on every retry and is checked in the same snapshot used by managed qualification;
+- if a source becomes unusable during the race window, the stale append fails its head comparison and the next replay rejects qualification;
+- incompatible content at the deterministic relation ID fails closed.
 
 This makes the operation idempotent at the semantic level without introducing locks or a second mutable authority store.
 
@@ -232,12 +240,14 @@ During replay:
 
 - Release records are recomputed against the exact pre-release ledger prefix;
 - RuntimeObservation and FeedbackCase bindings are checked for exact content hash, expected type where applicable, and chronology;
+- every managed feedback qualification is revalidated against the exact pre-qualification prefix, including source usability;
+- a deterministic feedback relation with incompatible immutable content fails closed;
 - duplicate `release_ref` values fail closed;
-- malformed or forged privileged M0.5 history poisons the semantic facade rather than being ignored.
+- malformed, forged, or historically ineligible privileged M0.5 history poisons the semantic facade rather than being ignored.
 
 Supported M0.5 adoption assumes the input ledger was semantically valid under the immediately preceding milestone. The prior M0.4 supported API mechanically reserved `Release`, `RuntimeObservation`, and `FeedbackCase`, so valid M0.4 history could not contain them through normal semantic creation.
 
-As in M0.4, Sayf does not cryptographically attest which historical runtime/version created every event. A caller able to bypass supported APIs remains inside the documented privileged local-write trust boundary.
+As in M0.4, Sayf does not cryptographically attest which historical runtime/version created every event. A caller able to bypass supported APIs remains inside the documented privileged local-write trust boundary, but M0.5 replay still rejects privileged history that violates the milestone's deterministic semantic rules.
 
 ## 9. Concurrency
 
@@ -249,7 +259,7 @@ Normal M0.5 semantic creation retains the exact semantic-head compare-and-append
 
 Any concurrent ledger commit forces revalidation.
 
-Feedback application spans two immutable writes by design (relation creation, then M0.3 qualification). Its deterministic relation identity and retry/re-read rules provide crash recovery and compatible concurrent convergence without making the inert relation authoritative before qualification.
+Feedback application spans two immutable writes by design (relation creation, then managed M0.5 qualification using the M0.3 invalidation event). Its deterministic relation identity and retry/re-read rules provide crash recovery and compatible concurrent convergence without making the inert relation authoritative before qualification. The authority-producing qualification specifically checks eligibility, relation semantics, and exact ledger head from one snapshot.
 
 ## 10. Performance boundary
 
@@ -257,7 +267,9 @@ M0.5 remains correctness-first.
 
 The full M0.4 GateProjection validates historical gate decisions once. Historical Release validation does **not** construct another complete GateProjection for every Release. For each Release prefix, M0.5 constructs only the M0.3 effective-state projection required to derive the bound gate's historical status.
 
-With D gate decisions, R releases, and N events, replay therefore remains approximately O((D + R) × N)-class prefix work rather than nesting D×N gate replay inside each Release. This is still not a high-throughput design.
+Historical managed feedback qualifications also reconstruct the M0.3 prefix immediately before qualification so source eligibility cannot be bypassed by privileged history.
+
+With D gate decisions, R releases, F managed feedback qualifications, and N events, replay therefore remains approximately O((D + R + F) × N)-class prefix work rather than nesting D×N gate replay inside each Release. This is still not a high-throughput design.
 
 No mutable projection cache or second authority store is introduced. A future accelerator requires a measured forcing function and must remain verifiable/disposable.
 
@@ -278,7 +290,7 @@ sayf explain impact <record_id> --max-depth 8 --max-results 100 --max-expansions
 sayf explain timeline <record_id> --max-entries 200
 ```
 
-Generic `sayf record create` rejects `Release`, `RuntimeObservation`, and `FeedbackCase`.
+Generic `sayf record create` rejects `Release`, `RuntimeObservation`, and `FeedbackCase`. Generic `sayf state invalidate` also refuses the deterministic relation owned by a FeedbackCase; use `sayf feedback apply` so M0.5 eligibility is enforced at qualification.
 
 ## 12. Acceptance slice
 
@@ -303,7 +315,7 @@ before apply(F1):
 
 apply(F1):
   deterministic invalidates relation F1 -> A1
-  explicit M0.3 invalidation qualification
+  managed eligibility + M0.3 invalidation qualification on one exact snapshot
 
 then:
   A1 invalidated
@@ -317,6 +329,10 @@ Complementary negative paths include:
 
 - a FeedbackCase/RuntimeObservation/runtime evidence that becomes unusable before application cannot create invalidation authority;
 - a pending deterministic feedback relation remains inert if its source evidence becomes unusable before qualification;
+- generic state invalidation cannot bypass the managed feedback eligibility boundary;
+- a privileged ineligible qualification event fails semantic replay at its historical prefix;
+- unrelated concurrent head movement during relation creation or qualification retries from a new snapshot and can converge;
+- source invalidation racing qualification causes the stale append to lose the exact-head check, after which revalidation blocks authority;
 - alternate explanation paths to the same endpoint are preserved;
 - result/work bounds fail closed;
 - a forged Release that did not have a historical fresh PERMIT fails semantic replay.
@@ -328,16 +344,18 @@ Complementary negative paths include:
 3. `authority_freshness` is not M0.3 record freshness and is not runtime health.
 4. Runtime observation is evidence, not state authority.
 5. Feedback classification is not state authority until explicitly applied.
-6. New feedback invalidation authority requires currently usable case/observation/runtime evidence.
-7. Pending feedback relations are inert until M0.3 qualification.
-8. Compatible concurrent/retried application converges on one deterministic relation and one qualification.
-9. Already-applied history is not erased by later source invalidation.
-10. Explainability preserves alternate simple recorded paths subject to explicit depth/result/work bounds.
-11. Explainability relationship paths are not proof of causality or truth.
-12. Release v1 does not claim byte-level deployed-artifact provenance.
-13. M0.5 semantic writes retain the exact-head TOCTOU guard.
-14. Malformed privileged M0.5 history fails closed.
-15. `RiskAssessment` remains reserved.
+6. New feedback invalidation authority requires currently usable case/observation/runtime evidence in the same snapshot used for qualification.
+7. Generic M0.3 invalidation cannot bypass the managed feedback qualification boundary.
+8. Historical managed feedback qualification is replay-validated at the pre-qualification prefix.
+9. Pending feedback relations are inert until qualification.
+10. Compatible concurrent/retried application converges on one deterministic relation and one qualification.
+11. Already-applied history is not erased by later source invalidation.
+12. Explainability preserves alternate simple recorded paths subject to explicit depth/result/work bounds.
+13. Explainability relationship paths are not proof of causality or truth.
+14. Release v1 does not claim byte-level deployed-artifact provenance.
+15. M0.5 semantic writes retain the exact-head TOCTOU guard.
+16. Malformed or historically ineligible privileged M0.5 history fails closed.
+17. `RiskAssessment` remains reserved.
 
 ## 14. Deferred scope
 
