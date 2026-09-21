@@ -10,6 +10,7 @@ from pydantic import BaseModel, ValidationError
 from sayf.artifacts import ArtifactStoreError
 from sayf.causal import CausalRepository
 from sayf.domain import Actor, ActorKind, EventDraft
+from sayf.feedback import FeedbackCaseSpec, ReleaseSpec, RuntimeObservationSpec
 from sayf.gates import GateRequestSpec, PolicySnapshotSpec, VerificationReceiptSpec
 from sayf.graph import GraphDirection, GraphProjectionError
 from sayf.records import (
@@ -32,6 +33,10 @@ state_app = typer.Typer(help="Qualify and inspect revision/staleness state.")
 verification_app = typer.Typer(help="Record bounded verification evidence.")
 policy_app = typer.Typer(help="Register immutable deterministic gate policies.")
 gate_app = typer.Typer(help="Request, evaluate, and inspect deterministic gates.")
+release_app = typer.Typer(help="Register and inspect release authority.")
+runtime_app = typer.Typer(help="Record immutable runtime observations.")
+feedback_app = typer.Typer(help="Open, apply, and inspect runtime feedback cases.")
+explain_app = typer.Typer(help="Explain why, impact, and record timelines.")
 artifact_app = typer.Typer(help="Register and verify content-addressed artifacts.")
 app.add_typer(ledger_app, name="ledger")
 app.add_typer(record_app, name="record")
@@ -41,6 +46,10 @@ app.add_typer(state_app, name="state")
 app.add_typer(verification_app, name="verification")
 app.add_typer(policy_app, name="policy")
 app.add_typer(gate_app, name="gate")
+app.add_typer(release_app, name="release")
+app.add_typer(runtime_app, name="runtime")
+app.add_typer(feedback_app, name="feedback")
+app.add_typer(explain_app, name="explain")
 app.add_typer(artifact_app, name="artifact")
 
 DEFAULT_DB = Path(".sayf/ledger.sqlite3")
@@ -498,6 +507,177 @@ def list_gate_decisions(
     except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
         _domain_error(exc)
     _echo_models(decisions)
+
+
+@release_app.command("register")
+def register_release(
+    payload: Annotated[str, typer.Option("--payload", help="Release specification JSON.")],
+    record_id: Annotated[str | None, typer.Option("--id")] = None,
+    actor_kind: Annotated[ActorKind, typer.Option("--actor-kind")] = ActorKind.HUMAN,
+    actor_id: Annotated[str, typer.Option("--actor-id")] = "local-user",
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        spec = ReleaseSpec.model_validate(_parse_payload(payload))
+    except ValidationError as exc:
+        raise typer.BadParameter(f"release specification is invalid: {exc}") from exc
+    try:
+        record = _repository(db, objects).register_release(
+            spec,
+            actor=_actor(actor_kind, actor_id),
+            record_id=record_id,
+        )
+    except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
+        _domain_error(exc)
+    _echo_model(record)
+
+
+@release_app.command("show")
+def show_release(
+    release_id: Annotated[str, typer.Argument()],
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        status = _repository(db, objects).release_status(release_id)
+    except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
+        _domain_error(exc)
+    _echo_model(status)
+
+
+@runtime_app.command("record")
+def record_runtime_observation(
+    payload: Annotated[
+        str,
+        typer.Option("--payload", help="Runtime observation specification JSON."),
+    ],
+    record_id: Annotated[str | None, typer.Option("--id")] = None,
+    actor_kind: Annotated[ActorKind, typer.Option("--actor-kind")] = ActorKind.TOOL,
+    actor_id: Annotated[str, typer.Option("--actor-id")] = "runtime-monitor",
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        spec = RuntimeObservationSpec.model_validate(_parse_payload(payload))
+    except ValidationError as exc:
+        raise typer.BadParameter(f"runtime observation specification is invalid: {exc}") from exc
+    try:
+        record = _repository(db, objects).record_runtime_observation(
+            spec,
+            actor=_actor(actor_kind, actor_id),
+            record_id=record_id,
+        )
+    except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
+        _domain_error(exc)
+    _echo_model(record)
+
+
+@feedback_app.command("open")
+def open_feedback_case(
+    payload: Annotated[str, typer.Option("--payload", help="Feedback case specification JSON.")],
+    record_id: Annotated[str | None, typer.Option("--id")] = None,
+    actor_kind: Annotated[ActorKind, typer.Option("--actor-kind")] = ActorKind.HUMAN,
+    actor_id: Annotated[str, typer.Option("--actor-id")] = "local-user",
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        spec = FeedbackCaseSpec.model_validate(_parse_payload(payload))
+    except ValidationError as exc:
+        raise typer.BadParameter(f"feedback case specification is invalid: {exc}") from exc
+    try:
+        record = _repository(db, objects).open_feedback_case(
+            spec,
+            actor=_actor(actor_kind, actor_id),
+            record_id=record_id,
+        )
+    except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
+        _domain_error(exc)
+    _echo_model(record)
+
+
+@feedback_app.command("apply")
+def apply_feedback(
+    case_id: Annotated[str, typer.Argument()],
+    actor_kind: Annotated[ActorKind, typer.Option("--actor-kind")] = ActorKind.HUMAN,
+    actor_id: Annotated[str, typer.Option("--actor-id")] = "local-user",
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        status = _repository(db, objects).apply_feedback(
+            case_id,
+            actor=_actor(actor_kind, actor_id),
+        )
+    except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
+        _domain_error(exc)
+    _echo_model(status)
+
+
+@feedback_app.command("show")
+def show_feedback(
+    case_id: Annotated[str, typer.Argument()],
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        status = _repository(db, objects).feedback_application_status(case_id)
+    except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
+        _domain_error(exc)
+    _echo_model(status)
+
+
+@explain_app.command("why")
+def explain_why(
+    record_id: Annotated[str, typer.Argument()],
+    max_depth: Annotated[int, typer.Option("--max-depth")] = 8,
+    max_results: Annotated[int, typer.Option("--max-results")] = 100,
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        paths = _repository(db, objects).why(
+            record_id,
+            max_depth=max_depth,
+            max_results=max_results,
+        )
+    except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
+        _domain_error(exc)
+    _echo_models(paths)
+
+
+@explain_app.command("impact")
+def explain_impact(
+    record_id: Annotated[str, typer.Argument()],
+    max_depth: Annotated[int, typer.Option("--max-depth")] = 8,
+    max_results: Annotated[int, typer.Option("--max-results")] = 100,
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        paths = _repository(db, objects).impact(
+            record_id,
+            max_depth=max_depth,
+            max_results=max_results,
+        )
+    except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
+        _domain_error(exc)
+    _echo_models(paths)
+
+
+@explain_app.command("timeline")
+def explain_timeline(
+    record_id: Annotated[str, typer.Argument()],
+    max_entries: Annotated[int, typer.Option("--max-entries")] = 200,
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        entries = _repository(db, objects).timeline(record_id, max_entries=max_entries)
+    except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
+        _domain_error(exc)
+    _echo_models(entries)
 
 
 @artifact_app.command("put")
