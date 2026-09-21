@@ -12,7 +12,7 @@ from sayf.feedback import (
     FeedbackApplicationState,
     FeedbackCaseSpec,
     M05ProjectionError,
-    ReleaseFreshness,
+    ReleaseAuthorityFreshness,
     ReleaseSpec,
     RuntimeObservationSpec,
 )
@@ -167,8 +167,8 @@ def test_release_requires_fresh_permit_and_duplicate_ref_is_rejected(tmp_path: P
     register_release(repo)
 
     status = repo.release_status("release1")
-    assert status.freshness is ReleaseFreshness.FRESH
-    assert status.stale_input_record_ids == ()
+    assert status.authority_freshness is ReleaseAuthorityFreshness.FRESH
+    assert status.stale_authority_record_ids == ()
 
     with pytest.raises(M05ProjectionError, match="already used"):
         repo.register_release(
@@ -212,7 +212,10 @@ def test_runtime_feedback_closes_loop_and_stales_gate_and_release(tmp_path: Path
     open_failed_feedback(repo)
 
     assert repo.gate_status("decision1").freshness is GateDecisionFreshness.FRESH
-    assert repo.release_status("release1").freshness is ReleaseFreshness.FRESH
+    assert (
+        repo.release_status("release1").authority_freshness
+        is ReleaseAuthorityFreshness.FRESH
+    )
 
     repo.apply_feedback("feedback1", actor=ACTOR)
 
@@ -220,9 +223,9 @@ def test_runtime_feedback_closes_loop_and_stales_gate_and_release(tmp_path: Path
     assert change_state.freshness.value == "stale"
     assert repo.gate_status("decision1").freshness is GateDecisionFreshness.STALE
     release = repo.release_status("release1")
-    assert release.freshness is ReleaseFreshness.STALE
-    assert "change1" in release.stale_input_record_ids
-    assert "decision1" in release.stale_input_record_ids
+    assert release.authority_freshness is ReleaseAuthorityFreshness.STALE
+    assert "change1" in release.stale_authority_record_ids
+    assert "decision1" in release.stale_authority_record_ids
 
 
 def test_why_and_impact_expose_feedback_and_authority_paths(tmp_path: Path) -> None:
@@ -277,7 +280,10 @@ def test_unrelated_event_does_not_stale_release(tmp_path: Path) -> None:
         )
     )
 
-    assert repo.release_status("release1").freshness is ReleaseFreshness.FRESH
+    assert (
+        repo.release_status("release1").authority_freshness
+        is ReleaseAuthorityFreshness.FRESH
+    )
 
 
 def test_privileged_release_without_valid_authority_fails_closed(tmp_path: Path) -> None:
@@ -325,8 +331,8 @@ def test_privileged_release_without_valid_authority_fails_closed(tmp_path: Path)
         release_ref="FORGED",
         subject={"record_id": subject.id, "content_hash": subject.content_hash},
         gate_decision={"record_id": gate.id, "content_hash": gate.content_hash},
-        subject_effective_state_hash="sha256:" + "0" * 64,
-        gate_decision_status_hash="sha256:" + "0" * 64,
+        authority_fingerprint_version=1,
+        authority_fingerprint="sha256:" + "0" * 64,
         environment={"stage": "production"},
     )
     repo.event_store.append(
