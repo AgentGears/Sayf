@@ -20,11 +20,12 @@ from sayf.gates import (
 from sayf.graph import CausalGraph, GraphProjectionError
 from sayf.hashing import HASH_PREFIX, canonical_json
 from sayf.records import (
-    GateDecisionPayload,
-    GateOutcome,
     FeedbackCasePayload,
     FeedbackClassification,
     FeedbackEffect,
+    GateDecisionPayload,
+    GateOutcome,
+    GateRequestPayload,
     Record,
     RecordBinding,
     RecordType,
@@ -33,9 +34,7 @@ from sayf.records import (
     ReleasePayload,
     RuntimeObservationPayload,
     RuntimeOutcome,
-    SemanticRecordType,
     VerificationReceiptPayload,
-    GateRequestPayload,
 )
 from sayf.state import (
     DEPENDENCY_BOUND_EVENT_TYPE,
@@ -415,19 +414,22 @@ class M05Projection:
         for edge in explain_edges:
             outgoing[edge.source_id].append(edge)
             incoming[edge.target_id].append(edge)
-        order = lambda edge: (
-            edge.sequence,
-            edge.kind.value,
-            edge.reference_id,
-            edge.source_id,
-            edge.target_id,
-        )
+
+        def edge_order(edge: ExplainEdge) -> tuple[int, str, str, str, str]:
+            return (
+                edge.sequence,
+                edge.kind.value,
+                edge.reference_id,
+                edge.source_id,
+                edge.target_id,
+            )
+
         self._outgoing = {
-            record_id: tuple(sorted(edges, key=order))
+            record_id: tuple(sorted(edges, key=edge_order))
             for record_id, edges in outgoing.items()
         }
         self._incoming = {
-            record_id: tuple(sorted(edges, key=order))
+            record_id: tuple(sorted(edges, key=edge_order))
             for record_id, edges in incoming.items()
         }
 
