@@ -13,6 +13,7 @@ from sayf.feedback import (
     FeedbackApplicationStatus,
     FeedbackCaseSpec,
     M05Projection,
+    M05ProjectionError,
     ReleaseSpec,
     ReleaseStatus,
     RuntimeObservationSpec,
@@ -21,6 +22,7 @@ from sayf.feedback import (
     build_release_payload,
     build_runtime_observation_payload,
     feedback_invalidation_relation_draft,
+    managed_feedback_case_id_for_relation,
 )
 from sayf.gates import (
     GateDecisionStatus,
@@ -360,6 +362,41 @@ class CausalRepository:
     def feedback_application_status(self, case_id: str) -> FeedbackApplicationStatus:
         return self.feedback().feedback_application_status(case_id)
 
+    def _qualify_feedback_invalidation(self, case_id: str, *, actor: Actor) -> LedgerEvent:
+        """Create feedback authority from one exact M0.5 eligibility snapshot."""
+        projection, expected_event_count, expected_head_hash = self._m05_snapshot()
+        status = projection.feedback_application_status(case_id)
+        if status.state is FeedbackApplicationState.APPLIED:
+            raise LedgerReadError(f"feedback case {case_id} is already applied")
+        if status.state is not FeedbackApplicationState.PENDING_QUALIFICATION:
+            raise LedgerReadError(
+                f"feedback case {case_id} has no pending relation to qualify"
+            )
+
+        projection.validate_feedback_application_eligibility(case_id)
+        state = projection.state_projection
+        relation = state.validate_invalidation(status.relation_id)
+        managed_case_id = managed_feedback_case_id_for_relation(
+            projection.graph,
+            relation.id,
+        )
+        if managed_case_id != case_id:
+            raise M05ProjectionError(
+                f"feedback relation {relation.id} is not managed by case {case_id}"
+            )
+
+        return append_if_ledger_head(
+            self.event_store,
+            EventDraft(
+                stream_id=f"state:{relation.id}",
+                event_type=RECORD_INVALIDATED_EVENT_TYPE,
+                actor=actor,
+                payload=semantic_relation_event_payload(relation),
+            ),
+            expected_event_count=expected_event_count,
+            expected_head_hash=expected_head_hash,
+        )
+
     def apply_feedback(self, case_id: str, *, actor: Actor) -> FeedbackApplicationStatus:
         """Apply one feedback invalidation with crash-safe and concurrency-safe retries."""
         self.event_store.initialize()
@@ -381,21 +418,21 @@ class CausalRepository:
                 except (LedgerReadError, GraphProjectionError) as exc:
                     last_error = exc
                     latest = self.feedback().feedback_application_status(case_id)
-                    if latest.state is FeedbackApplicationState.NOT_APPLIED:
-                        raise
+                    if latest.state is FeedbackApplicationState.APPLIED:
+                        return latest
+                    # NOT_APPLIED can mean an unrelated exact-head race; retry.
+                    # PENDING means compatible competing progress; retry qualification.
                 continue
 
-            # A pending deterministic relation is inert until this qualification.
-            # Eligibility is revalidated on every loop immediately before authority.
             try:
-                self.invalidate(status.relation_id, actor=actor)
-            except (LedgerReadError, GraphProjectionError) as exc:
+                self._qualify_feedback_invalidation(case_id, actor=actor)
+            except LedgerReadError as exc:
                 last_error = exc
                 latest = self.feedback().feedback_application_status(case_id)
                 if latest.state is FeedbackApplicationState.APPLIED:
                     return latest
-                if latest.state is FeedbackApplicationState.PENDING_QUALIFICATION:
-                    raise
+                # PENDING means either unrelated head movement or compatible progress.
+                # Retry from a new semantic snapshot so eligibility is checked again.
                 continue
             return self.feedback().feedback_application_status(case_id)
 
@@ -473,11 +510,21 @@ class CausalRepository:
         actor: Actor,
     ) -> LedgerEvent:
         self.event_store.initialize()
-        _, state, _, expected_event_count, expected_head_hash = self._semantic_snapshot()
+        projection, expected_event_count, expected_head_hash = self._m05_snapshot()
+        state = projection.state_projection
 
         if event_type == DEPENDENCY_BOUND_EVENT_TYPE:
             relation = state.validate_dependency_binding(relation_id)
         elif event_type == RECORD_INVALIDATED_EVENT_TYPE:
+            managed_case_id = managed_feedback_case_id_for_relation(
+                projection.graph,
+                relation_id,
+            )
+            if managed_case_id is not None:
+                raise M05ProjectionError(
+                    f"managed feedback invalidation relation {relation_id} must be "
+                    f"qualified through apply_feedback({managed_case_id!r})"
+                )
             relation = state.validate_invalidation(relation_id)
         elif event_type == RECORD_SUPERSEDED_EVENT_TYPE:
             relation = state.validate_supersession(relation_id)
