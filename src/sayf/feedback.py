@@ -446,6 +446,110 @@ def feedback_invalidation_relation_draft(case_record: Record) -> RelationDraft:
     )
 
 
+def managed_feedback_case_id_for_relation(
+    graph: CausalGraph,
+    relation_id: str,
+) -> str | None:
+    """Return the FeedbackCase owning a managed deterministic invalidation relation."""
+    relation = graph.relation(relation_id)
+    source = graph.record(relation.source_id)
+    if source.type is not RecordType.FEEDBACK_CASE:
+        return None
+    if relation.id != feedback_invalidation_relation_id(source.id):
+        return None
+
+    expected = feedback_invalidation_relation_draft(source)
+    if (
+        relation.type is not expected.relation_type
+        or relation.source_id != expected.source_id
+        or relation.target_id != expected.target_id
+        or relation.metadata != expected.metadata
+    ):
+        raise M05ProjectionError(
+            f"managed feedback relation {relation.id} has incompatible immutable content"
+        )
+    return source.id
+
+
+def validate_feedback_application_eligibility_for_state(
+    graph: CausalGraph,
+    state: EffectiveStateProjection,
+    case_id: str,
+) -> None:
+    """Require source records for new feedback authority to be usable in one state."""
+    case = graph.record(case_id)
+    if case.type is not RecordType.FEEDBACK_CASE:
+        raise M05ProjectionError(f"record {case_id} is not a FeedbackCase")
+    payload = _feedback_payload(case)
+    observation = _resolve_binding(
+        graph,
+        payload.observation,
+        expected_type=RecordType.RUNTIME_OBSERVATION,
+        before_sequence=case.created_sequence,
+        role=f"feedback case {case.id} observation",
+    )
+    runtime = _runtime_payload(observation)
+
+    source_ids = [case.id, observation.id]
+    source_ids.extend(binding.record_id for binding in runtime.evidence)
+    unusable = [
+        record_id
+        for record_id in source_ids
+        if not _is_usable_state(state.state(record_id))
+    ]
+    if unusable:
+        raise M05ProjectionError(
+            f"feedback case {case.id} cannot create invalidation authority because "
+            "source records are not usable: " + ", ".join(unusable)
+        )
+
+
+def _validate_feedback_qualification_history(
+    events: tuple[LedgerEvent, ...],
+    graph: CausalGraph,
+) -> None:
+    """Fail closed if historical managed feedback authority bypassed eligibility."""
+    for case in (record for record in graph.records if record.type is RecordType.FEEDBACK_CASE):
+        relation_id = feedback_invalidation_relation_id(case.id)
+        try:
+            graph.relation(relation_id)
+        except GraphProjectionError:
+            continue
+        managed_case_id = managed_feedback_case_id_for_relation(graph, relation_id)
+        if managed_case_id != case.id:
+            raise M05ProjectionError(
+                f"feedback relation id {relation_id} is occupied by incompatible content"
+            )
+
+    for event in events:
+        if event.event_type != RECORD_INVALIDATED_EVENT_TYPE:
+            continue
+        payload = SemanticRelationPayload.model_validate(event.payload)
+        try:
+            case_id = managed_feedback_case_id_for_relation(graph, payload.relation_id)
+        except GraphProjectionError:
+            continue
+        if case_id is None:
+            continue
+
+        prefix = events[: event.sequence - 1]
+        prefix_state = EffectiveStateProjection.from_events(prefix)
+        prefix_case_id = managed_feedback_case_id_for_relation(
+            prefix_state.graph,
+            payload.relation_id,
+        )
+        if prefix_case_id != case_id:
+            raise M05ProjectionError(
+                f"managed feedback qualification {event.event_id} does not bind its "
+                "expected FeedbackCase at the historical activation prefix"
+            )
+        validate_feedback_application_eligibility_for_state(
+            prefix_state.graph,
+            prefix_state,
+            case_id,
+        )
+
+
 class M05Projection:
     """Derived M0.5 release, feedback, and explanation state over immutable history."""
 
@@ -579,6 +683,8 @@ class M05Projection:
                     f"invalid M0.5 semantic record at ledger sequence "
                     f"{record.created_sequence} ({record.id}): {exc}"
                 ) from exc
+
+        _validate_feedback_qualification_history(event_list, graph)
 
         release_statuses: dict[str, ReleaseStatus] = {}
         for record in graph.records:
@@ -833,13 +939,8 @@ class M05Projection:
                 state=FeedbackApplicationState.NOT_APPLIED,
             )
 
-        expected = feedback_invalidation_relation_draft(case)
-        if (
-            relation.type is not expected.relation_type
-            or relation.source_id != expected.source_id
-            or relation.target_id != expected.target_id
-            or relation.metadata != expected.metadata
-        ):
+        managed_case_id = managed_feedback_case_id_for_relation(self._graph, relation_id)
+        if managed_case_id != case.id:
             raise M05ProjectionError(
                 f"feedback relation id {relation_id} is occupied by incompatible content"
             )
@@ -863,31 +964,11 @@ class M05Projection:
 
     def validate_feedback_application_eligibility(self, case_id: str) -> None:
         """Require all source evidence for new feedback authority to remain usable."""
-        case = self._graph.record(case_id)
-        if case.type is not RecordType.FEEDBACK_CASE:
-            raise M05ProjectionError(f"record {case_id} is not a FeedbackCase")
-        payload = _feedback_payload(case)
-        observation = _resolve_binding(
+        validate_feedback_application_eligibility_for_state(
             self._graph,
-            payload.observation,
-            expected_type=RecordType.RUNTIME_OBSERVATION,
-            before_sequence=case.created_sequence,
-            role=f"feedback case {case.id} observation",
+            self._state,
+            case_id,
         )
-        runtime = _runtime_payload(observation)
-
-        source_ids = [case.id, observation.id]
-        source_ids.extend(binding.record_id for binding in runtime.evidence)
-        unusable = [
-            record_id
-            for record_id in source_ids
-            if not _is_usable_state(self._state.state(record_id))
-        ]
-        if unusable:
-            raise M05ProjectionError(
-                f"feedback case {case.id} cannot create invalidation authority because "
-                "source records are not usable: " + ", ".join(unusable)
-            )
 
     @staticmethod
     def _validate_query_bounds(
