@@ -7,6 +7,22 @@ from pydantic import BaseModel
 
 from sayf.artifacts import ArtifactVerification, ContentAddressedArtifactStore
 from sayf.domain import Actor, EventDraft, LedgerEvent
+from sayf.feedback import (
+    ExplainEdge,
+    ExplanationPath,
+    FeedbackApplicationState,
+    FeedbackApplicationStatus,
+    FeedbackCaseSpec,
+    M05Projection,
+    ReleaseSpec,
+    ReleaseStatus,
+    RuntimeObservationSpec,
+    TimelineEntry,
+    build_feedback_case_payload,
+    build_release_payload,
+    build_runtime_observation_payload,
+    feedback_invalidation_relation_draft,
+)
 from sayf.gates import (
     GateDecisionStatus,
     GateProjection,
@@ -77,6 +93,12 @@ class CausalRepository:
             artifact_store=ContentAddressedArtifactStore(artifact_root),
         )
 
+    def _m05_snapshot(self) -> tuple[M05Projection, int, str | None]:
+        events = self.event_store.events()
+        projection = M05Projection.from_events(events)
+        head_hash = events[-1].event_hash if events else None
+        return projection, len(events), head_hash
+
     def _semantic_snapshot(
         self,
     ) -> tuple[
@@ -86,12 +108,14 @@ class CausalRepository:
         int,
         str | None,
     ]:
-        events = self.event_store.events()
-        gates = GateProjection.from_events(events)
-        state = gates.state_projection
-        graph = gates.graph
-        head_hash = events[-1].event_hash if events else None
-        return graph, state, gates, len(events), head_hash
+        projection, event_count, head_hash = self._m05_snapshot()
+        return (
+            projection.graph,
+            projection.state_projection,
+            projection.gate_projection,
+            event_count,
+            head_hash,
+        )
 
     def _graph_snapshot(self) -> tuple[CausalGraph, int, str | None]:
         graph, _, _, event_count, head_hash = self._semantic_snapshot()
@@ -108,6 +132,10 @@ class CausalRepository:
     def gates(self) -> GateProjection:
         _, _, gates, _, _ = self._semantic_snapshot()
         return gates
+
+    def feedback(self) -> M05Projection:
+        projection, _, _ = self._m05_snapshot()
+        return projection
 
     def create_record(self, draft: RecordDraft, *, actor: Actor) -> Record:
         snapshot = RecordDraft.model_validate(draft.model_dump(mode="python"))
@@ -256,6 +284,128 @@ class CausalRepository:
 
     def gate_status(self, decision_id: str) -> GateDecisionStatus:
         return self.gates().status(decision_id)
+
+    def register_release(
+        self,
+        spec: ReleaseSpec,
+        *,
+        actor: Actor,
+        record_id: str | None = None,
+    ) -> Record:
+        snapshot = ReleaseSpec.model_validate(spec.model_dump(mode="python"))
+        self.event_store.initialize()
+        projection, expected_event_count, expected_head_hash = self._m05_snapshot()
+        projection.validate_release_ref_available(snapshot.release_ref)
+        payload = build_release_payload(
+            projection.graph,
+            projection.state_projection,
+            projection.gate_projection,
+            snapshot,
+        )
+        return self._append_semantic_record(
+            RecordType.RELEASE,
+            payload,
+            actor=actor,
+            record_id=record_id,
+            graph=projection.graph,
+            expected_event_count=expected_event_count,
+            expected_head_hash=expected_head_hash,
+        )
+
+    def release_status(self, release_id: str) -> ReleaseStatus:
+        return self.feedback().release_status(release_id)
+
+    def record_runtime_observation(
+        self,
+        spec: RuntimeObservationSpec,
+        *,
+        actor: Actor,
+        record_id: str | None = None,
+    ) -> Record:
+        snapshot = RuntimeObservationSpec.model_validate(spec.model_dump(mode="python"))
+        self.event_store.initialize()
+        projection, expected_event_count, expected_head_hash = self._m05_snapshot()
+        payload = build_runtime_observation_payload(projection.graph, snapshot)
+        return self._append_semantic_record(
+            RecordType.RUNTIME_OBSERVATION,
+            payload,
+            actor=actor,
+            record_id=record_id,
+            graph=projection.graph,
+            expected_event_count=expected_event_count,
+            expected_head_hash=expected_head_hash,
+        )
+
+    def open_feedback_case(
+        self,
+        spec: FeedbackCaseSpec,
+        *,
+        actor: Actor,
+        record_id: str | None = None,
+    ) -> Record:
+        snapshot = FeedbackCaseSpec.model_validate(spec.model_dump(mode="python"))
+        self.event_store.initialize()
+        projection, expected_event_count, expected_head_hash = self._m05_snapshot()
+        payload = build_feedback_case_payload(projection.graph, snapshot)
+        return self._append_semantic_record(
+            RecordType.FEEDBACK_CASE,
+            payload,
+            actor=actor,
+            record_id=record_id,
+            graph=projection.graph,
+            expected_event_count=expected_event_count,
+            expected_head_hash=expected_head_hash,
+        )
+
+    def feedback_application_status(self, case_id: str) -> FeedbackApplicationStatus:
+        return self.feedback().feedback_application_status(case_id)
+
+    def apply_feedback(self, case_id: str, *, actor: Actor) -> FeedbackApplicationStatus:
+        self.event_store.initialize()
+        projection, _, _ = self._m05_snapshot()
+        status = projection.feedback_application_status(case_id)
+        if status.state is FeedbackApplicationState.APPLIED:
+            return status
+        case_record = projection.graph.record(case_id)
+        draft = feedback_invalidation_relation_draft(case_record)
+        if status.state is FeedbackApplicationState.NOT_APPLIED:
+            self.create_relation(draft, actor=actor)
+
+        projection, _, _ = self._m05_snapshot()
+        status = projection.feedback_application_status(case_id)
+        if status.state is FeedbackApplicationState.APPLIED:
+            return status
+        self.invalidate(status.relation_id, actor=actor)
+        return self.feedback().feedback_application_status(case_id)
+
+    def why(
+        self,
+        record_id: str,
+        *,
+        max_depth: int = 8,
+        max_results: int = 100,
+    ) -> tuple[ExplanationPath, ...]:
+        return self.feedback().why(
+            record_id,
+            max_depth=max_depth,
+            max_results=max_results,
+        )
+
+    def impact(
+        self,
+        record_id: str,
+        *,
+        max_depth: int = 8,
+        max_results: int = 100,
+    ) -> tuple[ExplanationPath, ...]:
+        return self.feedback().impact(
+            record_id,
+            max_depth=max_depth,
+            max_results=max_results,
+        )
+
+    def timeline(self, record_id: str, *, max_entries: int = 200) -> tuple[TimelineEntry, ...]:
+        return self.feedback().timeline(record_id, max_entries=max_entries)
 
     def create_relation(self, draft: RelationDraft, *, actor: Actor) -> Relation:
         snapshot = RelationDraft.model_validate(draft.model_dump(mode="python"))
