@@ -240,37 +240,41 @@ def test_favorable_assessment_does_not_satisfy_policy_without_qualification_rece
     assert "risk:qualified" in decision.payload["missing_requirements"]
 
 
-def test_risk_qualification_requires_same_subject(tmp_path: Path) -> None:
+def test_risk_qualification_requires_same_subject_before_append(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     create_record(repo, "change1", RecordType.CHANGE_SET)
     create_record(repo, "change2", RecordType.CHANGE_SET)
     create_record(repo, "risk_evidence1", RecordType.EVIDENCE)
     create_risk_assessment(repo)
 
-    repo.record_verification(
-        risk_receipt_spec(subject_id="change2"),
-        actor=VERIFIER,
-        record_id="bad_receipt",
-    )
-
     with pytest.raises(RiskProjectionError, match="different ChangeSet subject"):
-        repo.graph()
+        repo.record_verification(
+            risk_receipt_spec(subject_id="change2"),
+            actor=VERIFIER,
+            record_id="bad_receipt",
+        )
+
+    with pytest.raises(GraphProjectionError):
+        repo.graph().record("bad_receipt")
 
 
-def test_risk_qualification_requires_assessment_evidence_closure(tmp_path: Path) -> None:
+def test_risk_qualification_requires_evidence_closure_before_append(
+    tmp_path: Path,
+) -> None:
     repo = repository(tmp_path)
     create_record(repo, "change1", RecordType.CHANGE_SET)
     create_record(repo, "risk_evidence1", RecordType.EVIDENCE)
     create_risk_assessment(repo)
 
-    repo.record_verification(
-        risk_receipt_spec(evidence_record_ids=("risk1",)),
-        actor=VERIFIER,
-        record_id="bad_receipt",
-    )
-
     with pytest.raises(RiskProjectionError, match="without binding its exact evidence"):
-        repo.graph()
+        repo.record_verification(
+            risk_receipt_spec(evidence_record_ids=("risk1",)),
+            actor=VERIFIER,
+            record_id="bad_receipt",
+        )
+
+    with pytest.raises(GraphProjectionError):
+        repo.graph().record("bad_receipt")
 
 
 def test_generic_record_surface_cannot_impersonate_risk_assessment() -> None:
