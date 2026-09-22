@@ -45,12 +45,14 @@ from sayf.records import (
     RecordType,
     Relation,
     RelationDraft,
+    RiskAssessmentPayload,
     record_event_payload,
     record_from_event,
     relation_event_payload,
     relation_from_event,
     semantic_record_event_payload,
 )
+from sayf.risk import M06Projection, RiskAssessmentSpec, build_risk_assessment_payload
 from sayf.semantic_append import append_if_ledger_head
 from sayf.state import (
     DEPENDENCY_BOUND_EVENT_TYPE,
@@ -94,11 +96,15 @@ class CausalRepository:
             artifact_store=ContentAddressedArtifactStore(artifact_root),
         )
 
-    def _m05_snapshot(self) -> tuple[M05Projection, int, str | None]:
+    def _m06_snapshot(self) -> tuple[M06Projection, int, str | None]:
         events = self.event_store.events()
-        projection = M05Projection.from_events(events)
+        projection = M06Projection.from_events(events)
         head_hash = events[-1].event_hash if events else None
         return projection, len(events), head_hash
+
+    def _m05_snapshot(self) -> tuple[M05Projection, int, str | None]:
+        projection, event_count, head_hash = self._m06_snapshot()
+        return projection.feedback_projection, event_count, head_hash
 
     def _semantic_snapshot(
         self,
@@ -136,6 +142,10 @@ class CausalRepository:
 
     def feedback(self) -> M05Projection:
         projection, _, _ = self._m05_snapshot()
+        return projection
+
+    def risk(self) -> M06Projection:
+        projection, _, _ = self._m06_snapshot()
         return projection
 
     def create_record(self, draft: RecordDraft, *, actor: Actor) -> Record:
@@ -199,6 +209,30 @@ class CausalRepository:
             expected_head_hash=expected_head_hash,
         )
         return record_from_event(event)
+
+    def record_risk_assessment(
+        self,
+        spec: RiskAssessmentSpec,
+        *,
+        actor: Actor,
+        record_id: str | None = None,
+    ) -> Record:
+        snapshot = RiskAssessmentSpec.model_validate(spec.model_dump(mode="python"))
+        self.event_store.initialize()
+        projection, expected_event_count, expected_head_hash = self._m06_snapshot()
+        payload = build_risk_assessment_payload(projection.graph, snapshot)
+        return self._append_semantic_record(
+            RecordType.RISK_ASSESSMENT,
+            payload,
+            actor=actor,
+            record_id=record_id,
+            graph=projection.graph,
+            expected_event_count=expected_event_count,
+            expected_head_hash=expected_head_hash,
+        )
+
+    def risk_assessment(self, record_id: str) -> RiskAssessmentPayload:
+        return self.risk().risk_assessment(record_id)
 
     def record_verification(
         self,
