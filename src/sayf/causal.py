@@ -52,7 +52,12 @@ from sayf.records import (
     relation_from_event,
     semantic_record_event_payload,
 )
-from sayf.risk import M06Projection, RiskAssessmentSpec, build_risk_assessment_payload
+from sayf.risk import (
+    M06Projection,
+    RiskAssessmentSpec,
+    build_risk_assessment_payload,
+    validate_verification_risk_composition,
+)
 from sayf.semantic_append import append_if_ledger_head
 from sayf.state import (
     DEPENDENCY_BOUND_EVENT_TYPE,
@@ -245,6 +250,11 @@ class CausalRepository:
         self.event_store.initialize()
         graph, _, _, expected_event_count, expected_head_hash = self._semantic_snapshot()
         payload = build_verification_receipt_payload(graph, snapshot)
+        validate_verification_risk_composition(
+            graph,
+            payload,
+            receipt_id=record_id or "<pending-verification-receipt>",
+        )
         return self._append_semantic_record(
             RecordType.VERIFICATION_RECEIPT,
             payload,
