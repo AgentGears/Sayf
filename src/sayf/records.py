@@ -67,12 +67,16 @@ M05_SEMANTIC_RECORD_TYPES = frozenset(
     }
 )
 
-SEMANTIC_RECORD_TYPES = M04_SEMANTIC_RECORD_TYPES | M05_SEMANTIC_RECORD_TYPES
+M06_SEMANTIC_RECORD_TYPES = frozenset({RecordType.RISK_ASSESSMENT})
 
-# RiskAssessment remains intentionally unavailable after M0.5. Persisting one through
-# the generic record surface would freeze authoritative-looking state before its
-# contract and policy semantics are defined.
-RESERVED_CONTRACT_RECORD_TYPES = frozenset({RecordType.RISK_ASSESSMENT})
+SEMANTIC_RECORD_TYPES = (
+    M04_SEMANTIC_RECORD_TYPES | M05_SEMANTIC_RECORD_TYPES | M06_SEMANTIC_RECORD_TYPES
+)
+
+# M0.6 activates the final previously reserved contract type. Keep this set as the
+# mechanical reservation boundary for future types if new authoritative-looking
+# contracts are added to RecordType before their semantics exist.
+RESERVED_CONTRACT_RECORD_TYPES: frozenset[RecordType] = frozenset()
 
 
 class VerificationResult(StrEnum):
@@ -114,6 +118,28 @@ class FeedbackEffect(StrEnum):
     INVALIDATE_TARGET = "invalidate_target"
 
 
+class RiskSeverity(StrEnum):
+    LOW = "low"
+    MODERATE = "moderate"
+    HIGH = "high"
+    CRITICAL = "critical"
+    UNKNOWN = "unknown"
+
+
+class RiskLikelihood(StrEnum):
+    UNLIKELY = "unlikely"
+    POSSIBLE = "possible"
+    LIKELY = "likely"
+    UNKNOWN = "unknown"
+
+
+class RiskConclusion(StrEnum):
+    ACCEPTABLE = "acceptable"
+    ATTENTION_REQUIRED = "attention_required"
+    UNACCEPTABLE = "unacceptable"
+    INCONCLUSIVE = "inconclusive"
+
+
 class RecordBinding(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -132,6 +158,72 @@ class RecordBinding(BaseModel):
         if not _SHA256_RE.fullmatch(value):
             raise ValueError("record binding hash must be lowercase sha256:<64 hex>")
         return value
+
+
+class RiskFinding(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    finding_id: str = Field(min_length=1)
+    category: str = Field(min_length=1)
+    statement: str = Field(min_length=1)
+    severity: RiskSeverity
+    likelihood: RiskLikelihood
+    mitigation: str | None = None
+    residual_severity: RiskSeverity
+
+    @field_validator("finding_id", "category", "statement")
+    @classmethod
+    def normalize_required_text(cls, value: str) -> str:
+        return _normalize_text(value, "risk finding text")
+
+    @field_validator("mitigation")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = _normalize_text(value, "risk mitigation")
+        if not value:
+            raise ValueError("risk mitigation must not be empty")
+        return value
+
+
+class RiskAssessmentPayload(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    subject: RecordBinding
+    method: str = Field(min_length=1)
+    findings: tuple[RiskFinding, ...] = ()
+    overall_conclusion: RiskConclusion
+    evidence: tuple[RecordBinding, ...] = ()
+    environment: dict[str, Any] = Field(min_length=1)
+    assumptions: tuple[str, ...] = ()
+    limitations: tuple[str, ...] = ()
+    prohibited_generalizations: tuple[str, ...] = ()
+
+    @field_validator("method")
+    @classmethod
+    def normalize_method(cls, value: str) -> str:
+        return _normalize_text(value, "risk assessment method")
+
+    @field_validator("environment", mode="before")
+    @classmethod
+    def normalize_environment(cls, value: Any) -> dict[str, Any]:
+        return _normalize_json_object(value, "risk assessment environment")
+
+    @field_validator("assumptions", "limitations", "prohibited_generalizations")
+    @classmethod
+    def normalize_text_tuple(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(_normalize_text(item, "risk assessment text") for item in value)
+
+    @model_validator(mode="after")
+    def validate_assessment_shape(self) -> RiskAssessmentPayload:
+        finding_ids = [finding.finding_id for finding in self.findings]
+        if len(finding_ids) != len(set(finding_ids)):
+            raise ValueError("risk finding ids must be unique within an assessment")
+        evidence_ids = [binding.record_id for binding in self.evidence]
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("risk evidence bindings must be unique by record id")
+        return self
 
 
 class VerificationRequirement(BaseModel):
@@ -384,6 +476,7 @@ _SEMANTIC_PAYLOAD_MODELS: dict[RecordType, type[BaseModel]] = {
     RecordType.RELEASE: ReleasePayload,
     RecordType.RUNTIME_OBSERVATION: RuntimeObservationPayload,
     RecordType.FEEDBACK_CASE: FeedbackCasePayload,
+    RecordType.RISK_ASSESSMENT: RiskAssessmentPayload,
 }
 
 
@@ -412,6 +505,11 @@ def _ensure_generic_record_creation_allowed(record_type: RecordType) -> None:
     if record_type in M05_SEMANTIC_RECORD_TYPES:
         raise ValueError(
             f"record type {record_type.value} must be created through its M0.5 "
+            "semantic API"
+        )
+    if record_type in M06_SEMANTIC_RECORD_TYPES:
+        raise ValueError(
+            f"record type {record_type.value} must be created through its M0.6 "
             "semantic API"
         )
 
