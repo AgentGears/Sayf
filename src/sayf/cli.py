@@ -21,6 +21,7 @@ from sayf.records import (
     RelationDraft,
     RelationType,
 )
+from sayf.risk import RiskAssessmentSpec
 from sayf.state import STATE_EVENT_TYPES
 from sayf.storage import LedgerReadError, SQLiteEventStore
 
@@ -31,6 +32,7 @@ relation_app = typer.Typer(help="Create immutable typed relations.")
 graph_app = typer.Typer(help="Traverse the deterministic typed-record graph.")
 state_app = typer.Typer(help="Qualify and inspect revision/staleness state.")
 verification_app = typer.Typer(help="Record bounded verification evidence.")
+risk_app = typer.Typer(help="Record and inspect bounded risk assessments.")
 policy_app = typer.Typer(help="Register immutable deterministic gate policies.")
 gate_app = typer.Typer(help="Request, evaluate, and inspect deterministic gates.")
 release_app = typer.Typer(help="Register and inspect release authority.")
@@ -44,6 +46,7 @@ app.add_typer(relation_app, name="relation")
 app.add_typer(graph_app, name="graph")
 app.add_typer(state_app, name="state")
 app.add_typer(verification_app, name="verification")
+app.add_typer(risk_app, name="risk")
 app.add_typer(policy_app, name="policy")
 app.add_typer(gate_app, name="gate")
 app.add_typer(release_app, name="release")
@@ -414,6 +417,54 @@ def record_verification(
     except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
         _domain_error(exc)
     _echo_model(record)
+
+
+@risk_app.command("assess")
+def assess_risk(
+    payload: Annotated[str, typer.Option("--payload", help="Risk assessment specification JSON.")],
+    record_id: Annotated[str | None, typer.Option("--id")] = None,
+    actor_kind: Annotated[ActorKind, typer.Option("--actor-kind")] = ActorKind.HUMAN,
+    actor_id: Annotated[str, typer.Option("--actor-id")] = "local-user",
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        spec = RiskAssessmentSpec.model_validate(_parse_payload(payload))
+    except ValidationError as exc:
+        raise typer.BadParameter(f"risk assessment specification is invalid: {exc}") from exc
+    try:
+        record = _repository(db, objects).record_risk_assessment(
+            spec,
+            actor=_actor(actor_kind, actor_id),
+            record_id=record_id,
+        )
+    except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
+        _domain_error(exc)
+    _echo_model(record)
+
+
+@risk_app.command("show")
+def show_risk(
+    risk_assessment_id: Annotated[str, typer.Argument()],
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB,
+    objects: Annotated[Path, typer.Option("--objects")] = DEFAULT_OBJECTS,
+) -> None:
+    try:
+        repo = _repository(db, objects)
+        repo.risk_assessment(risk_assessment_id)
+        record = repo.graph().record(risk_assessment_id)
+        state = repo.effective_state().state(risk_assessment_id)
+    except (LedgerReadError, GraphProjectionError, ValidationError, ValueError) as exc:
+        _domain_error(exc)
+    typer.echo(
+        json.dumps(
+            {
+                "record": record.model_dump(mode="json"),
+                "effective_state": state.model_dump(mode="json"),
+            },
+            indent=2,
+        )
+    )
 
 
 @policy_app.command("register")
