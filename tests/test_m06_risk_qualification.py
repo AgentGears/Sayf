@@ -13,6 +13,7 @@ from sayf.gates import (
     PolicySnapshotSpec,
     VerificationReceiptSpec,
 )
+from sayf.graph import GraphProjectionError
 from sayf.records import (
     GateOutcome,
     RecordDraft,
@@ -240,7 +241,7 @@ def test_risk_assessment_requires_changeset_subject(tmp_path: Path) -> None:
             record_id="risk1",
         )
 
-    with pytest.raises(Exception):
+    with pytest.raises(GraphProjectionError):
         repo.graph().record("risk1")
 
 
@@ -263,5 +264,5 @@ def test_duplicate_findings_fail_before_append(tmp_path: Path) -> None:
             record_id="risk1",
         )
 
-    with pytest.raises(Exception):
+    with pytest.raises(GraphProjectionError):
         repo.graph().record("risk1")
