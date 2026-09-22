@@ -15,6 +15,7 @@ from sayf.records import (
     RiskAssessmentPayload,
     RiskConclusion,
     RiskFinding,
+    VerificationReceiptPayload,
 )
 
 
@@ -130,6 +131,34 @@ def build_risk_assessment_payload(
     )
 
 
+def validate_verification_risk_composition(
+    graph: CausalGraph,
+    payload: VerificationReceiptPayload,
+    *,
+    receipt_id: str,
+) -> None:
+    """Keep RiskAssessment qualification bound to its subject and evidence closure."""
+    evidence_by_id = {binding.record_id: binding for binding in payload.evidence}
+    for binding in payload.evidence:
+        evidence_record = graph.record(binding.record_id)
+        if evidence_record.type is not RecordType.RISK_ASSESSMENT:
+            continue
+        assessment = _risk_payload(evidence_record)
+        if payload.subject != assessment.subject:
+            raise RiskProjectionError(
+                f"verification receipt {receipt_id} uses risk assessment "
+                f"{evidence_record.id} for a different ChangeSet subject"
+            )
+        for required_binding in assessment.evidence:
+            actual_binding = evidence_by_id.get(required_binding.record_id)
+            if actual_binding != required_binding:
+                raise RiskProjectionError(
+                    f"verification receipt {receipt_id} uses risk assessment "
+                    f"{evidence_record.id} without binding its exact evidence record "
+                    f"{required_binding.record_id}"
+                )
+
+
 class M06Projection:
     """M0.6 semantic projection layered over fully validated M0.5 history."""
 
@@ -173,6 +202,24 @@ class M06Projection:
             except (ValidationError, GraphProjectionError, ValueError) as exc:
                 raise RiskProjectionError(
                     f"invalid M0.6 semantic record at ledger sequence "
+                    f"{record.created_sequence} ({record.id}): {exc}"
+                ) from exc
+
+        for record in graph.records:
+            if record.type is not RecordType.VERIFICATION_RECEIPT:
+                continue
+            try:
+                receipt = VerificationReceiptPayload.model_validate(record.payload)
+                validate_verification_risk_composition(
+                    graph,
+                    receipt,
+                    receipt_id=record.id,
+                )
+            except RiskProjectionError:
+                raise
+            except (ValidationError, GraphProjectionError, ValueError) as exc:
+                raise RiskProjectionError(
+                    f"invalid M0.6 risk qualification at ledger sequence "
                     f"{record.created_sequence} ({record.id}): {exc}"
                 ) from exc
 
