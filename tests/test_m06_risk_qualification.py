@@ -83,20 +83,28 @@ def create_risk_assessment(repo: CausalRepository, *, record_id: str = "risk1") 
     )
 
 
+def risk_receipt_spec(
+    *,
+    subject_id: str = "change1",
+    evidence_record_ids: tuple[str, ...] = ("risk1", "risk_evidence1"),
+) -> VerificationReceiptSpec:
+    return VerificationReceiptSpec(
+        subject_id=subject_id,
+        contract="risk:qualified",
+        result=VerificationResult.PASS,
+        evidence_record_ids=evidence_record_ids,
+        environment={"stage": "pre-release"},
+        independent_from_generation=VerificationIndependence.YES,
+        verified_claim=(
+            "the bound risk assessment satisfies the bounded risk qualification "
+            "contract for change1"
+        ),
+    )
+
+
 def qualify_and_release(repo: CausalRepository) -> None:
     repo.record_verification(
-        VerificationReceiptSpec(
-            subject_id="change1",
-            contract="risk:qualified",
-            result=VerificationResult.PASS,
-            evidence_record_ids=("risk1",),
-            environment={"stage": "pre-release"},
-            independent_from_generation=VerificationIndependence.YES,
-            verified_claim=(
-                "the bound risk assessment satisfies the bounded risk qualification "
-                "contract for change1"
-            ),
-        ),
+        risk_receipt_spec(),
         actor=VERIFIER,
         record_id="risk_receipt1",
     )
@@ -135,18 +143,20 @@ def qualify_and_release(repo: CausalRepository) -> None:
     )
 
 
-def invalidate_risk(repo: CausalRepository) -> None:
-    create_record(repo, "risk_observation1", RecordType.OBSERVATION)
+def invalidate_record(repo: CausalRepository, target_id: str, suffix: str) -> None:
+    source_id = f"risk_observation_{suffix}"
+    relation_id = f"risk_invalidated_{suffix}"
+    create_record(repo, source_id, RecordType.OBSERVATION)
     repo.create_relation(
         RelationDraft(
-            relation_id="risk_invalidated",
+            relation_id=relation_id,
             relation_type=RelationType.INVALIDATES,
-            source_id="risk_observation1",
-            target_id="risk1",
+            source_id=source_id,
+            target_id=target_id,
         ),
         actor=ACTOR,
     )
-    repo.invalidate("risk_invalidated", actor=ACTOR)
+    repo.invalidate(relation_id, actor=ACTOR)
 
 
 def test_risk_qualification_composes_with_existing_gate_and_release_authority(
@@ -168,7 +178,7 @@ def test_risk_qualification_composes_with_existing_gate_and_release_authority(
         is ReleaseAuthorityFreshness.FRESH
     )
 
-    invalidate_risk(repo)
+    invalidate_record(repo, "risk1", "assessment")
 
     gate_status = repo.gate_status("decision1")
     assert gate_status.freshness is GateDecisionFreshness.STALE
@@ -176,6 +186,23 @@ def test_risk_qualification_composes_with_existing_gate_and_release_authority(
     release_status = repo.release_status("release1")
     assert release_status.authority_freshness is ReleaseAuthorityFreshness.STALE
     assert "risk1" in release_status.stale_authority_record_ids
+
+
+def test_risk_underlying_evidence_change_stales_gate_and_release(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    create_record(repo, "change1", RecordType.CHANGE_SET)
+    create_record(repo, "risk_evidence1", RecordType.EVIDENCE)
+    create_risk_assessment(repo)
+    qualify_and_release(repo)
+
+    invalidate_record(repo, "risk_evidence1", "evidence")
+
+    gate_status = repo.gate_status("decision1")
+    assert gate_status.freshness is GateDecisionFreshness.STALE
+    assert "risk_evidence1" in gate_status.stale_input_record_ids
+    release_status = repo.release_status("release1")
+    assert release_status.authority_freshness is ReleaseAuthorityFreshness.STALE
+    assert "risk_evidence1" in release_status.stale_authority_record_ids
 
 
 def test_favorable_assessment_does_not_satisfy_policy_without_qualification_receipt(
@@ -211,6 +238,39 @@ def test_favorable_assessment_does_not_satisfy_policy_without_qualification_rece
 
     assert decision.payload["outcome"] == GateOutcome.BLOCK.value
     assert "risk:qualified" in decision.payload["missing_requirements"]
+
+
+def test_risk_qualification_requires_same_subject(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    create_record(repo, "change1", RecordType.CHANGE_SET)
+    create_record(repo, "change2", RecordType.CHANGE_SET)
+    create_record(repo, "risk_evidence1", RecordType.EVIDENCE)
+    create_risk_assessment(repo)
+
+    repo.record_verification(
+        risk_receipt_spec(subject_id="change2"),
+        actor=VERIFIER,
+        record_id="bad_receipt",
+    )
+
+    with pytest.raises(RiskProjectionError, match="different ChangeSet subject"):
+        repo.graph()
+
+
+def test_risk_qualification_requires_assessment_evidence_closure(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    create_record(repo, "change1", RecordType.CHANGE_SET)
+    create_record(repo, "risk_evidence1", RecordType.EVIDENCE)
+    create_risk_assessment(repo)
+
+    repo.record_verification(
+        risk_receipt_spec(evidence_record_ids=("risk1",)),
+        actor=VERIFIER,
+        record_id="bad_receipt",
+    )
+
+    with pytest.raises(RiskProjectionError, match="without binding its exact evidence"):
+        repo.graph()
 
 
 def test_generic_record_surface_cannot_impersonate_risk_assessment() -> None:
