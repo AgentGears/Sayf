@@ -7,6 +7,23 @@ from pydantic import BaseModel
 
 from sayf.artifacts import ArtifactVerification, ContentAddressedArtifactStore
 from sayf.domain import Actor, EventDraft, LedgerEvent
+from sayf.feedback import (
+    ExplanationPath,
+    FeedbackApplicationState,
+    FeedbackApplicationStatus,
+    FeedbackCaseSpec,
+    M05Projection,
+    M05ProjectionError,
+    ReleaseSpec,
+    ReleaseStatus,
+    RuntimeObservationSpec,
+    TimelineEntry,
+    build_feedback_case_payload,
+    build_release_payload,
+    build_runtime_observation_payload,
+    feedback_invalidation_relation_draft,
+    managed_feedback_case_id_for_relation,
+)
 from sayf.gates import (
     GateDecisionStatus,
     GateProjection,
@@ -77,6 +94,12 @@ class CausalRepository:
             artifact_store=ContentAddressedArtifactStore(artifact_root),
         )
 
+    def _m05_snapshot(self) -> tuple[M05Projection, int, str | None]:
+        events = self.event_store.events()
+        projection = M05Projection.from_events(events)
+        head_hash = events[-1].event_hash if events else None
+        return projection, len(events), head_hash
+
     def _semantic_snapshot(
         self,
     ) -> tuple[
@@ -86,12 +109,14 @@ class CausalRepository:
         int,
         str | None,
     ]:
-        events = self.event_store.events()
-        gates = GateProjection.from_events(events)
-        state = gates.state_projection
-        graph = gates.graph
-        head_hash = events[-1].event_hash if events else None
-        return graph, state, gates, len(events), head_hash
+        projection, event_count, head_hash = self._m05_snapshot()
+        return (
+            projection.graph,
+            projection.state_projection,
+            projection.gate_projection,
+            event_count,
+            head_hash,
+        )
 
     def _graph_snapshot(self) -> tuple[CausalGraph, int, str | None]:
         graph, _, _, event_count, head_hash = self._semantic_snapshot()
@@ -108,6 +133,10 @@ class CausalRepository:
     def gates(self) -> GateProjection:
         _, _, gates, _, _ = self._semantic_snapshot()
         return gates
+
+    def feedback(self) -> M05Projection:
+        projection, _, _ = self._m05_snapshot()
+        return projection
 
     def create_record(self, draft: RecordDraft, *, actor: Actor) -> Record:
         snapshot = RecordDraft.model_validate(draft.model_dump(mode="python"))
@@ -257,6 +286,195 @@ class CausalRepository:
     def gate_status(self, decision_id: str) -> GateDecisionStatus:
         return self.gates().status(decision_id)
 
+    def register_release(
+        self,
+        spec: ReleaseSpec,
+        *,
+        actor: Actor,
+        record_id: str | None = None,
+    ) -> Record:
+        snapshot = ReleaseSpec.model_validate(spec.model_dump(mode="python"))
+        self.event_store.initialize()
+        projection, expected_event_count, expected_head_hash = self._m05_snapshot()
+        projection.validate_release_ref_available(snapshot.release_ref)
+        gate_status = projection.gate_projection.status(snapshot.gate_decision_id)
+        payload = build_release_payload(
+            projection.graph,
+            projection.state_projection,
+            gate_status,
+            snapshot,
+        )
+        return self._append_semantic_record(
+            RecordType.RELEASE,
+            payload,
+            actor=actor,
+            record_id=record_id,
+            graph=projection.graph,
+            expected_event_count=expected_event_count,
+            expected_head_hash=expected_head_hash,
+        )
+
+    def release_status(self, release_id: str) -> ReleaseStatus:
+        return self.feedback().release_status(release_id)
+
+    def record_runtime_observation(
+        self,
+        spec: RuntimeObservationSpec,
+        *,
+        actor: Actor,
+        record_id: str | None = None,
+    ) -> Record:
+        snapshot = RuntimeObservationSpec.model_validate(spec.model_dump(mode="python"))
+        self.event_store.initialize()
+        projection, expected_event_count, expected_head_hash = self._m05_snapshot()
+        payload = build_runtime_observation_payload(projection.graph, snapshot)
+        return self._append_semantic_record(
+            RecordType.RUNTIME_OBSERVATION,
+            payload,
+            actor=actor,
+            record_id=record_id,
+            graph=projection.graph,
+            expected_event_count=expected_event_count,
+            expected_head_hash=expected_head_hash,
+        )
+
+    def open_feedback_case(
+        self,
+        spec: FeedbackCaseSpec,
+        *,
+        actor: Actor,
+        record_id: str | None = None,
+    ) -> Record:
+        snapshot = FeedbackCaseSpec.model_validate(spec.model_dump(mode="python"))
+        self.event_store.initialize()
+        projection, expected_event_count, expected_head_hash = self._m05_snapshot()
+        payload = build_feedback_case_payload(projection.graph, snapshot)
+        return self._append_semantic_record(
+            RecordType.FEEDBACK_CASE,
+            payload,
+            actor=actor,
+            record_id=record_id,
+            graph=projection.graph,
+            expected_event_count=expected_event_count,
+            expected_head_hash=expected_head_hash,
+        )
+
+    def feedback_application_status(self, case_id: str) -> FeedbackApplicationStatus:
+        return self.feedback().feedback_application_status(case_id)
+
+    def _qualify_feedback_invalidation(self, case_id: str, *, actor: Actor) -> LedgerEvent:
+        """Create feedback authority from one exact M0.5 eligibility snapshot."""
+        projection, expected_event_count, expected_head_hash = self._m05_snapshot()
+        status = projection.feedback_application_status(case_id)
+        if status.state is FeedbackApplicationState.APPLIED:
+            raise LedgerReadError(f"feedback case {case_id} is already applied")
+        if status.state is not FeedbackApplicationState.PENDING_QUALIFICATION:
+            raise LedgerReadError(
+                f"feedback case {case_id} has no pending relation to qualify"
+            )
+
+        projection.validate_feedback_application_eligibility(case_id)
+        state = projection.state_projection
+        relation = state.validate_invalidation(status.relation_id)
+        managed_case_id = managed_feedback_case_id_for_relation(
+            projection.graph,
+            relation.id,
+        )
+        if managed_case_id != case_id:
+            raise M05ProjectionError(
+                f"feedback relation {relation.id} is not managed by case {case_id}"
+            )
+
+        return append_if_ledger_head(
+            self.event_store,
+            EventDraft(
+                stream_id=f"state:{relation.id}",
+                event_type=RECORD_INVALIDATED_EVENT_TYPE,
+                actor=actor,
+                payload=semantic_relation_event_payload(relation),
+            ),
+            expected_event_count=expected_event_count,
+            expected_head_hash=expected_head_hash,
+        )
+
+    def apply_feedback(self, case_id: str, *, actor: Actor) -> FeedbackApplicationStatus:
+        """Apply one feedback invalidation with crash-safe and concurrency-safe retries."""
+        self.event_store.initialize()
+        last_error: Exception | None = None
+
+        for _ in range(4):
+            projection, _, _ = self._m05_snapshot()
+            status = projection.feedback_application_status(case_id)
+            if status.state is FeedbackApplicationState.APPLIED:
+                return status
+
+            projection.validate_feedback_application_eligibility(case_id)
+            case_record = projection.graph.record(case_id)
+            draft = feedback_invalidation_relation_draft(case_record)
+
+            if status.state is FeedbackApplicationState.NOT_APPLIED:
+                try:
+                    self.create_relation(draft, actor=actor)
+                except (LedgerReadError, GraphProjectionError) as exc:
+                    last_error = exc
+                    latest = self.feedback().feedback_application_status(case_id)
+                    if latest.state is FeedbackApplicationState.APPLIED:
+                        return latest
+                    # NOT_APPLIED can mean an unrelated exact-head race; retry.
+                    # PENDING means compatible competing progress; retry qualification.
+                continue
+
+            try:
+                self._qualify_feedback_invalidation(case_id, actor=actor)
+            except LedgerReadError as exc:
+                last_error = exc
+                latest = self.feedback().feedback_application_status(case_id)
+                if latest.state is FeedbackApplicationState.APPLIED:
+                    return latest
+                # PENDING means either unrelated head movement or compatible progress.
+                # Retry from a new semantic snapshot so eligibility is checked again.
+                continue
+            return self.feedback().feedback_application_status(case_id)
+
+        if last_error is not None:
+            raise LedgerReadError(
+                "feedback application did not converge after concurrent ledger changes"
+            ) from last_error
+        raise LedgerReadError("feedback application did not converge")
+
+    def why(
+        self,
+        record_id: str,
+        *,
+        max_depth: int = 8,
+        max_results: int = 100,
+        max_expansions: int = 10_000,
+    ) -> tuple[ExplanationPath, ...]:
+        return self.feedback().why(
+            record_id,
+            max_depth=max_depth,
+            max_results=max_results,
+            max_expansions=max_expansions,
+        )
+
+    def impact(
+        self,
+        record_id: str,
+        *,
+        max_depth: int = 8,
+        max_results: int = 100,
+        max_expansions: int = 10_000,
+    ) -> tuple[ExplanationPath, ...]:
+        return self.feedback().impact(
+            record_id,
+            max_depth=max_depth,
+            max_results=max_results,
+            max_expansions=max_expansions,
+        )
+
+    def timeline(self, record_id: str, *, max_entries: int = 200) -> tuple[TimelineEntry, ...]:
+        return self.feedback().timeline(record_id, max_entries=max_entries)
+
     def create_relation(self, draft: RelationDraft, *, actor: Actor) -> Relation:
         snapshot = RelationDraft.model_validate(draft.model_dump(mode="python"))
         self.event_store.initialize()
@@ -292,11 +510,21 @@ class CausalRepository:
         actor: Actor,
     ) -> LedgerEvent:
         self.event_store.initialize()
-        _, state, _, expected_event_count, expected_head_hash = self._semantic_snapshot()
+        projection, expected_event_count, expected_head_hash = self._m05_snapshot()
+        state = projection.state_projection
 
         if event_type == DEPENDENCY_BOUND_EVENT_TYPE:
             relation = state.validate_dependency_binding(relation_id)
         elif event_type == RECORD_INVALIDATED_EVENT_TYPE:
+            managed_case_id = managed_feedback_case_id_for_relation(
+                projection.graph,
+                relation_id,
+            )
+            if managed_case_id is not None:
+                raise M05ProjectionError(
+                    f"managed feedback invalidation relation {relation_id} must be "
+                    f"qualified through apply_feedback({managed_case_id!r})"
+                )
             relation = state.validate_invalidation(relation_id)
         elif event_type == RECORD_SUPERSEDED_EVENT_TYPE:
             relation = state.validate_supersession(relation_id)

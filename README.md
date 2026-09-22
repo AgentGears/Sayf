@@ -45,9 +45,9 @@ M0 establishes the substrate beneath the control plane:
 - **M0.2 Typed Records + Graph** — immutable typed records/relations derived from ledger history, content-addressed artifacts, deterministic traversal and relationship paths.
 - **M0.3 Revision + Staleness** — explicit relation qualification, invalidation, linear supersession, and deterministic dependency staleness.
 - **M0.4 Evidence + Gates** — bounded verification receipts, immutable policy snapshots, exact gate requests, deterministic gate decisions, and decision staleness.
-- **M0.5 Feedback + Explainability** — runtime observations, feedback cases, `why`, `impact`, and `timeline`.
+- **M0.5 Feedback + Explainability** — release authority, runtime observations, explicit feedback application, and bounded `why`, `impact`, and `timeline` queries.
 
-The current codebase implements **M0.1 through M0.4**. Release authority, risk-assessment contracts, runtime feedback, and full explanation queries remain deliberately deferred.
+The current candidate codebase implements **M0.1 through M0.5**. `Release`, `RuntimeObservation`, and `FeedbackCase` are active semantic contracts created only through their dedicated M0.5 APIs. `RiskAssessment` remains deliberately reserved.
 
 ## Quick start
 
@@ -116,6 +116,26 @@ sayf gate request \
 sayf gate evaluate gate_request_1 --id gate_decision_1
 sayf gate show gate_decision_1
 
+sayf release register \
+  --id release_1 \
+  --payload '{"release_ref":"R1","subject_id":"change_1","gate_decision_id":"gate_decision_1","environment":{"stage":"production"}}'
+sayf release show release_1
+
+sayf runtime record \
+  --id runtime_1 \
+  --payload '{"release_id":"release_1","outcome":"failed","summary":"runtime behavior contradicted an assumption","environment":{"stage":"production"}}'
+
+# Feedback classification is not state authority until explicitly applied.
+sayf feedback open \
+  --id feedback_1 \
+  --payload '{"observation_id":"runtime_1","target_id":"rec_assumption","classification":"falsifies","proposed_effect":"invalidate_target","rationale":"runtime evidence falsifies the bound assumption"}'
+sayf feedback show feedback_1
+sayf feedback apply feedback_1
+
+sayf explain why release_1 --max-expansions 10000
+sayf explain impact rec_assumption --max-expansions 10000
+sayf explain timeline rec_assumption
+
 printf 'verification receipt\n' > receipt.txt
 sayf artifact put receipt.txt \
   --id rec_receipt \
@@ -153,7 +173,7 @@ Graph neighbor queries support outbound, inbound, and combined traversal. Relati
 
 Artifacts use SHA-256 content-addressed storage under `.sayf/objects/sha256/...`. Object bytes are verified against the digest, and an existing or concurrently appearing corrupt object at the expected address is rejected rather than silently overwritten. POSIX publication uses a no-replace hard-link installation of the already-fsynced staging inode and therefore fails closed on a filesystem that cannot provide the required hard-link primitive; Windows uses a write-through no-replace move. This CAS publication requirement is separate from M0.1 ledger initialization, which remains hard-link-independent. An object becomes referenced Sayf engineering state only when an immutable `Artifact` record binds its digest, byte length, metadata, actor, and creating event into the ledger. Unreferenced CAS bytes are not authoritative records.
 
-Except for typed contracts implemented by later milestones, active record payloads are canonical JSON objects. M0.4 activates `VerificationReceipt`, `PolicySnapshot`, `GateRequest`, and `GateDecision` only through their dedicated semantic APIs; they cannot be created through the generic record surface. `RiskAssessment`, `Release`, `RuntimeObservation`, and `FeedbackCase` remain mechanically reserved until their contracts exist. This preserves the rule that a future authoritative-looking type name does not acquire authority merely because generic JSON was stored under that name.
+Except for typed contracts implemented by later milestones, active record payloads are canonical JSON objects. M0.4 activates `VerificationReceipt`, `PolicySnapshot`, `GateRequest`, and `GateDecision`; M0.5 activates `Release`, `RuntimeObservation`, and `FeedbackCase`. These semantic record types are created only through their dedicated APIs and cannot be created through the generic record surface. `RiskAssessment` remains mechanically reserved until its contract exists. This preserves the rule that an authoritative-looking type name does not acquire authority merely because generic JSON was stored under that name.
 
 M0.2 relationship claims remain distinct from M0.3 state authority. In particular, `depends_on`, `invalidates`, and `supersedes` relations have no state consequence until an explicit M0.3 qualification event adopts that exact relation.
 
@@ -191,7 +211,7 @@ The M0.3 actor field is provenance, not an authorization system. In the local-fi
 
 Effective-state projection is correctness-first and currently recomputes from fully verified history. Staleness derivation may revisit the qualified dependency graph once per invalidated/superseded root, so this is not yet a high-throughput design. Persistent projections or incremental invalidation indexes should be introduced only after measurement establishes a forcing function and only if they remain verifiable, disposable acceleration state.
 
-`state affected` is intentionally narrower than the future M0.5 `impact` query: it reports records currently stale because the requested record is an invalidated or superseded root. It does not claim to enumerate policy, gate, release, or runtime consequences.
+`state affected` is intentionally narrower than M0.5 `impact`: it reports records currently stale because the requested record is an invalidated or superseded root. M0.5 `impact` additionally traverses recorded authority and historical-reference bindings and therefore is not equivalent to automatic state propagation.
 
 See [`docs/architecture/M0_3_REVISION_STALENESS.md`](docs/architecture/M0_3_REVISION_STALENESS.md) for the M0.3 contract, qualification boundary, and acceptance slice.
 
@@ -211,7 +231,7 @@ Every persisted gate decision is independently recomputed during replay from the
 
 A decision also binds the complete canonical M0.3 effective-state fingerprint for every evaluated input, not only the three coarse labels. A later invalidation cause, supersession, dependency-derived staleness path, or other change to that exact effective state makes the historical decision currently stale. The decision record's own M0.3 state must also remain usable. Unrelated ledger events that do not change a bound effective state do not stale the decision.
 
-Gate freshness is independent from gate outcome. A BLOCK decision can remain fresh when it still describes the same unchanged negative input state. Likewise, a historical PERMIT remains historically what was decided even after its current status becomes stale. `PERMIT` means only that the exact request satisfied the exact policy under the exact evaluated state; it does **not** mean released, globally approved, safe, correct, or complete. Release authority remains deferred.
+Gate freshness is independent from gate outcome. A BLOCK decision can remain fresh when it still describes the same unchanged negative input state. Likewise, a historical PERMIT remains historically what was decided even after its current status becomes stale. `PERMIT` means only that the exact request satisfied the exact policy under the exact evaluated state; it does **not** mean globally approved, safe, correct, or complete. M0.5 may register a Release only when the exact bound decision is a currently fresh PERMIT for the exact ChangeSet.
 
 M0.4 retains the exact semantic-head compare-and-append boundary for receipt, policy, request, and decision creation. A concurrent ledger commit after validation forces revalidation rather than allowing a decision to commit against a stale semantic snapshot.
 
@@ -232,22 +252,56 @@ The actor field on M0.4 records remains provenance, not authenticated identity. 
 
 See [`docs/architecture/M0_4_EVIDENCE_GATES.md`](docs/architecture/M0_4_EVIDENCE_GATES.md) for the M0.4 contract, claim ceilings, replay rules, and acceptance slice.
 
+## M0.5 — Feedback + Explainability
+
+M0.5 activates `Release`, `RuntimeObservation`, and `FeedbackCase` through dedicated semantic APIs and closes the first explicit runtime feedback loop.
+
+A v1 Release binds the exact logical `ChangeSet`, exact `GateDecision`, a versioned minimal release-authority fingerprint, and recorded environment/context. It can be created only from a currently fresh M0.4 `PERMIT` for that exact ChangeSet. Current Release status uses the deliberately distinct field `authority_freshness`; this reports whether the recorded authority chain remains current, **not** M0.3 record freshness, runtime health, correctness, safety, or successful deployment.
+
+A RuntimeObservation is evidence about an exact historical Release. A failed observation alone has no state consequence. A FeedbackCase records a classification of one exact RuntimeObservation against one exact target and may propose `invalidate_target`; merely opening the case still has no state authority.
+
+Applying invalidating feedback creates one deterministic `invalidates` relation from the FeedbackCase to its target and explicitly qualifies that relation through M0.3. Before new invalidation authority can be created or qualified, the FeedbackCase, bound RuntimeObservation, and every bound runtime evidence record must still be `not_invalidated/current/fresh`. A crash after relation creation leaves an inert `pending_qualification` state. Compatible retries/concurrent callers converge on the same deterministic relation/qualification; incompatible content fails closed. Once applied, the historical invalidation is not erased by later source invalidation.
+
+`why` and `impact` preserve alternate simple recorded paths and distinguish state, authority, and historical-reference edges. They are bounded by depth, result count, and total edge expansions. Exceeding a bound fails rather than silently truncating. These queries expose recorded relationships; they do **not** prove truth, physical causality, complete real-world impact, or automatic state propagation. `timeline` exposes the record's relevant immutable event history under its own entry bound.
+
+M0.5 Release v1 deliberately stops at logical ChangeSet/gate provenance. It does **not** attest that a particular executable, container image, package digest, filesystem tree, or deployed target byte-for-byte corresponds to the ChangeSet. `release_ref` and environment are context, not deployment attestation. Exact deployed-artifact provenance requires a later explicit Artifact/deployment contract.
+
+Historical replay remains correctness-first. M0.4 gate history is validated once; each historical Release then reconstructs only the required M0.3 prefix state and derives the bound decision's status rather than recursively replaying a complete GateProjection. With D decisions, R releases, and N events, the intended cost is approximately O((D + R) × N)-class prefix work rather than nesting D×N gate replay inside each Release.
+
+The dedicated CLI surface is:
+
+```text
+sayf release register --payload <json>
+sayf release show <release_id>
+sayf runtime record --payload <json>
+sayf feedback open --payload <json>
+sayf feedback show <case_id>
+sayf feedback apply <case_id>
+sayf explain why <record_id> --max-expansions 10000
+sayf explain impact <record_id> --max-expansions 10000
+sayf explain timeline <record_id>
+```
+
+See [`docs/architecture/M0_5_FEEDBACK_EXPLAINABILITY.md`](docs/architecture/M0_5_FEEDBACK_EXPLAINABILITY.md) for the exact authority boundary, replay model, feedback eligibility, query claim ceilings, concurrency semantics, performance boundary, and acceptance loop.
+
 ## Design invariants
 
 1. **No silent mutation** — accepted historical state is superseded, never rewritten.
 2. **No missing provenance** — durable state identifies the actor and event that created it.
-3. **No unsupported authority** — an agent assertion, relation label, receipt, or type name is not authoritative merely because it was emitted.
-4. **No stale reuse** — typed/state/gate writes bind the exact ledger head whose semantics they validated.
-5. **No hidden downstream impact** — invalidated or superseded premises expose qualified stale dependents and gate decisions bind exact effective-state fingerprints.
+3. **No unsupported authority** — an agent assertion, relation label, receipt, observation, feedback classification, or type name is not authoritative merely because it was emitted.
+4. **No stale reuse** — typed/state/gate/release writes bind the exact ledger head whose semantics they validated.
+5. **No hidden downstream impact** — invalidated or superseded premises expose qualified stale dependents; gates and releases expose stale bound authority; explanation paths expose recorded relationships without pretending all edges propagate state.
 6. **Unknown is not pass** — absence of invalidation, supersession, staleness, or evidence is not promoted into truth, acceptance, verification, or pass.
 7. **Unknown storage is fail-closed** — existing authority stores are validated before authoritative read or mutation.
 8. **Derived semantic state is disposable** — authoritative history remains in immutable ledger events.
-9. **Bounded queries are explicit** — relationship-path limits fail rather than silently presenting partial results as complete.
+9. **Bounded queries are explicit** — relationship/explanation path depth, result, and work limits fail rather than silently presenting partial results as complete.
 10. **CAS publication is no-clobber** — an existing or racing digest address is verified/reused or rejected, never overwritten by normal publication.
 11. **Relation claim is not adoption** — M0.3 state consequences require explicit qualification of an exact immutable relation.
 12. **Evidence is not gate authority** — M0.4 gate outcomes require an exact immutable request and policy, not merely the presence of verification records.
-13. **Gate permit is not release authority** — M0.4 deliberately stops before release registration or approval.
-14. **Historical decisions remain challengeable** — later changes to bound effective-state fingerprints stale prior gate decisions without rewriting them.
+13. **Gate permit is not automatically a Release** — M0.5 requires an explicit Release registration that binds an exact currently fresh PERMIT and exact ChangeSet.
+14. **Observation/classification is not state authority** — runtime evidence affects effective state only through an explicit qualified transition whose source remains eligible at application time.
+15. **Historical authority remains challengeable** — later changes stale prior gate/release authority without rewriting the historical records.
+16. **Release authority is not deployment attestation** — M0.5 v1 does not infer deployed bytes from logical release context.
 
 ## Development
 
@@ -259,7 +313,7 @@ pytest
 
 CI executes the suite on Python 3.12 under both Ubuntu and Windows.
 
-See [`docs/architecture/VISION.md`](docs/architecture/VISION.md), [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md), [`docs/architecture/M0_CAUSAL_LEDGER.md`](docs/architecture/M0_CAUSAL_LEDGER.md), [`docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md`](docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md), [`docs/architecture/M0_3_REVISION_STALENESS.md`](docs/architecture/M0_3_REVISION_STALENESS.md), and [`docs/architecture/M0_4_EVIDENCE_GATES.md`](docs/architecture/M0_4_EVIDENCE_GATES.md).
+See [`docs/architecture/VISION.md`](docs/architecture/VISION.md), [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md), [`docs/architecture/M0_CAUSAL_LEDGER.md`](docs/architecture/M0_CAUSAL_LEDGER.md), [`docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md`](docs/architecture/M0_2_TYPED_RECORDS_GRAPH.md), [`docs/architecture/M0_3_REVISION_STALENESS.md`](docs/architecture/M0_3_REVISION_STALENESS.md), [`docs/architecture/M0_4_EVIDENCE_GATES.md`](docs/architecture/M0_4_EVIDENCE_GATES.md), and [`docs/architecture/M0_5_FEEDBACK_EXPLAINABILITY.md`](docs/architecture/M0_5_FEEDBACK_EXPLAINABILITY.md).
 
 ## License
 
