@@ -149,7 +149,7 @@ def open_failed_feedback(repo: CausalRepository) -> None:
     )
 
 
-def test_m05_semantic_types_require_dedicated_api_and_risk_remains_reserved() -> None:
+def test_semantic_types_require_their_dedicated_milestone_api() -> None:
     for record_type in (
         RecordType.RELEASE,
         RecordType.RUNTIME_OBSERVATION,
@@ -157,7 +157,7 @@ def test_m05_semantic_types_require_dedicated_api_and_risk_remains_reserved() ->
     ):
         with pytest.raises(ValidationError, match="M0.5 semantic API"):
             RecordDraft(record_type=record_type, payload={})
-    with pytest.raises(ValidationError, match="reserved"):
+    with pytest.raises(ValidationError, match="M0.6 semantic API"):
         RecordDraft(record_type=RecordType.RISK_ASSESSMENT, payload={})
 
 
